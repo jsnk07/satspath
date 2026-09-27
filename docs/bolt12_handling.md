@@ -8,7 +8,7 @@ BOLT12 (Lightning Offers) provides reusable, static payment codes that support:
 - Recipient and payer privacy via **blinded paths**.
 - Native integration with BIP-353 (`user@domain` TXT record resolution to `lno1...`).
 
-SatsPath implements full discovery, offer parsing, blinded path extraction, invoice request generation, invoice validation, and gateway handoff for BOLT12 payments.
+BOLT12 — EXPERIMENTAL / PARTIAL. Prototype TLV, offer-handling, and blinded-path primitives exist, but standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and interoperability with implementations such as Core Lightning and LDK remain incomplete.
 
 ---
 
@@ -45,7 +45,7 @@ Recipient Profile / BIP-353
 
 ## Data Structures and TLV Encoding
 
-BOLT12 encodes all records using standard Type-Length-Value (TLV) streams inside bech32m payloads.
+BOLT12 encodes records using Type-Length-Value (TLV) streams inside bech32-style payloads (note: official BOLT12 uses its own bech32 format without the standard BIP-350 Bech32m checksum).
 
 ### 1. Bolt12Offer
 - **HRP:** `lno` (Mainnet), `lnot` (Testnet), `lnob` (Regtest).
@@ -72,7 +72,7 @@ In SatsPath's routing engine, offers containing valid blinded paths receive an i
 ### 3. Bolt12InvoiceRequest
 - **HRP:** `lnr` / `lnrt`.
 - Created by the payer when initiating payment.
-- Contains `offer_id` (SHA-256 digest of offer TLV without signature), `invreq_amount`, `payer_node_id`, optional `payer_note`, and a BIP-340 Schnorr signature.
+- Contains `offer_id` (currently computed via SHA-256 over concatenated TLVs; full all-TLV Merkle tree root alignment is scheduled for v0.2), `invreq_amount`, `payer_node_id`, optional `payer_note`, and a BIP-340 Schnorr signature.
 
 ### 4. Bolt12Invoice
 - **HRP:** `lni` / `lnit`.

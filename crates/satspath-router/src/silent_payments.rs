@@ -1,3 +1,9 @@
+//! Silent Payments (BIP-352) — EXPERIMENTAL.
+//!
+//! Experimental Silent Payments primitives and address/output construction are implemented.
+//! BIP-352 conformance and interoperability remain unverified until the official send/receive
+//! test vectors pass.
+
 use anyhow::{anyhow, Result};
 use bech32::{FromBase32, ToBase32, Variant};
 use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, SecretKey};
