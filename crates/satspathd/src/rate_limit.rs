@@ -265,26 +265,27 @@ impl RateLimiter {
 /// Security:
 /// - If `trust_proxy_headers` is FALSE, headers like `X-Forwarded-For` and `X-Real-IP`
 ///   are strictly ignored to prevent client IP spoofing attacks. The peer socket IP is returned.
-/// - If `trust_proxy_headers` is TRUE, the leftmost IP in `X-Forwarded-For` is extracted
-///   as the original client address. If absent, `X-Real-IP` is checked. If both are absent
-///   or invalid, it falls back to the peer socket IP.
+/// - If `trust_proxy_headers` is TRUE, the rightmost IP in the last `X-Forwarded-For`
+///   header is used: that is the address the trusted proxy itself observed and appended
+///   (nginx `$proxy_add_x_forwarded_for`) or set (Caddy `{remote_host}`). Every entry to
+///   its left is client-supplied, so taking the leftmost would let a client pick its own
+///   rate-limit bucket. If absent, `X-Real-IP` is checked. If both are absent or invalid,
+///   it falls back to the peer socket IP.
 pub fn extract_client_ip(
     remote_addr: Option<&SocketAddr>,
     headers: &[Header],
     trust_proxy_headers: bool,
 ) -> IpAddr {
     if trust_proxy_headers {
-        // Priority 1: X-Forwarded-For (client, proxy1, proxy2...)
-        for header in headers {
-            if header.field.equiv("x-forwarded-for") {
-                let val = header.value.as_str();
-                if let Some(first_ip_str) = val.split(',').next() {
-                    let trimmed = first_ip_str.trim();
-                    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
-            }
+        // Priority 1: X-Forwarded-For (client-supplied..., proxy-observed peer)
+        let proxy_observed = headers
+            .iter()
+            .rev()
+            .find(|h| h.field.equiv("x-forwarded-for"))
+            .and_then(|h| h.value.as_str().rsplit(',').next())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok());
+        if let Some(ip) = proxy_observed {
+            return ip;
         }
 
         // Priority 2: X-Real-IP
@@ -467,11 +468,19 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
         );
 
-        // When trust_proxy_headers is true, leftmost X-Forwarded-For client IP is extracted
+        // When trust_proxy_headers is true, the proxy-appended (rightmost) entry is used;
+        // the client-supplied leftmost entry is ignored.
         let extracted_trusted = extract_client_ip(Some(&peer_addr), &headers, true);
+        assert_eq!(extracted_trusted, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+
+        // With multiple headers, the last one (added by the trusted proxy) wins.
+        let multi = vec![
+            Header::from_bytes(&b"X-Forwarded-For"[..], &b"1.2.3.4"[..]).unwrap(),
+            Header::from_bytes(&b"X-Forwarded-For"[..], &b"5.6.7.8, 203.0.113.9"[..]).unwrap(),
+        ];
         assert_eq!(
-            extracted_trusted,
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 195))
+            extract_client_ip(Some(&peer_addr), &multi, true),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
         );
     }
 
@@ -488,7 +497,7 @@ mod tests {
         // Malformed IP fallback to peer address
         let headers_malformed =
             vec![
-                Header::from_bytes(&b"X-Forwarded-For"[..], &b"invalid-ip, 10.0.0.1"[..]).unwrap(),
+                Header::from_bytes(&b"X-Forwarded-For"[..], &b"10.0.0.1, invalid-ip"[..]).unwrap(),
             ];
         let ip_fallback = extract_client_ip(Some(&peer_addr), &headers_malformed, true);
         assert_eq!(ip_fallback, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)));

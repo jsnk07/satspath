@@ -527,21 +527,22 @@ mod tests {
         let (base_url, server, _handle) = start_test_daemon(config).await;
         let client = reqwest::Client::new();
 
-        // Client 1 (203.0.113.1) uses its 2 burst tokens
-        for _ in 0..2 {
+        // Client 1 (203.0.113.1, appended by the proxy) uses its 2 burst tokens while
+        // rotating a spoofed leftmost entry; the spoofed values must not reset its bucket.
+        for spoofed in ["1.1.1.1", "2.2.2.2"] {
             let res = client
                 .get(format!("{base_url}/health"))
-                .header("X-Forwarded-For", "203.0.113.1, 10.0.0.1")
+                .header("X-Forwarded-For", format!("{spoofed}, 203.0.113.1"))
                 .send()
                 .await
                 .unwrap();
             assert_eq!(res.status(), reqwest::StatusCode::OK);
         }
 
-        // Client 1's 3rd request is blocked (429)
+        // Client 1's 3rd request is blocked (429) despite yet another spoofed entry
         let res_c1_blocked = client
             .get(format!("{base_url}/health"))
-            .header("X-Forwarded-For", "203.0.113.1, 10.0.0.1")
+            .header("X-Forwarded-For", "3.3.3.3, 203.0.113.1")
             .send()
             .await
             .unwrap();

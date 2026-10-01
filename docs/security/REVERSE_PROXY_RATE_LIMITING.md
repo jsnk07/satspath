@@ -31,7 +31,7 @@ This document describes:
 ### Reverse Proxy IP Extraction & Spoofing Protection
 - By default, `satspathd` strictly uses the peer socket address (`remote_addr`) to prevent client IP spoofing attacks via forged headers.
 - When deployed behind a trusted reverse proxy, pass `--behind-proxy` or set `SATSPATHD_BEHIND_PROXY=1`.
-- When enabled, `satspathd` inspects `X-Forwarded-For` (taking the leftmost client IP) and `X-Real-IP`, falling back to the peer socket IP if headers are missing or malformed.
+- When enabled, `satspathd` inspects `X-Forwarded-For` (taking the rightmost entry, which the trusted proxy appended; entries to its left are client-supplied and ignored) and `X-Real-IP`, falling back to the peer socket IP if headers are missing or malformed.
 
 ### Configuration Flags and Environment Variables
 - `--behind-proxy` or `SATSPATHD_BEHIND_PROXY=1`: Enable reverse proxy header trust.
