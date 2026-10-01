@@ -61,7 +61,7 @@ The following feature branches have been merged directly into `main`:
 | :--- | :--- | :--- |
 | `ChainResolver` (compositor with anti-substitution) | [`resolver.rs`](../crates/satspath-core/src/resolver.rs) | ✅ Complete |
 | `HttpResolver` (HTTPS `.well-known` + NIP-05) | [`http.rs`](../crates/satspath-core/src/resolvers/http.rs) | ✅ Complete (SSRF-hardened) |
-| `Bip353Resolver` (DNS TXT via DoH) | [`bip353.rs`](../crates/satspath-core/src/resolvers/bip353.rs) | ✅ Complete |
+| `Bip353Resolver` (DNS TXT, strict local DNSSEC; no synthetic signatures) | [`bip353.rs`](../crates/satspath-core/src/resolvers/bip353.rs) | ✅ Complete |
 | `NostrResolver` (NIP-05 author binding) | [`nostr.rs`](../crates/satspath-core/src/resolvers/nostr.rs) | ✅ Complete |
 | `PearResolver` (Hyperswarm P2P sidecar) | [`pear.rs`](../crates/satspath-core/src/resolvers/pear.rs) | ✅ Functional |
 

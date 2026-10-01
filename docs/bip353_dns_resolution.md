@@ -69,9 +69,16 @@ malicious resolver.
 | `Strict` (default) | Require real DNSSEC validation; **fail closed** otherwise.                                                                     |
 | `DevInsecure`      | Local testing only. Accept unvalidated records with loud warnings. Never the default; requires `--allow-insecure-dns-for-dev`. |
 
-This build does not ship a local DNSSEC validator, so `Strict` resolution **fails
-closed** with a clear message (option C of the BIP-353 DNSSEC guidance). A future
-release can plug in a validating resolver without changing the contract. The
+`Strict` resolution uses `HickoryDnssecTxtResolver`, which validates DNSSEC
+locally against the root trust anchor (hickory-resolver with `validate = true`
+drops any RRset that does not chain-validate). Anything that cannot be validated
+**fails closed** with a clear message. The DoH JSON backend cannot validate
+DNSSEC and is only used in `DevInsecure` mode.
+
+A BIP-353 record is a payment instruction authenticated by DNSSEC for the
+domain. It is **not** a profile signed by the recipient's SatsPath identity key:
+the resolver never synthesizes a key or signature for it, and `pay` labels it
+as a DNS-authenticated instruction rather than a verified signature. The
 `--allow-insecure-dns-for-dev` flag prints a scary warning and must never be used
 on mainnet.
 
@@ -177,6 +184,7 @@ the signed profile **after** BIP-353 verifies the domain.
 ## Security checklist
 
 - [x] DNSSEC required; `Strict` fails closed (no AD-bit trust).
+- [x] No synthetic keys or signatures: a BIP-353 result is never surfaced as a signed identity.
 - [x] Multiple `bitcoin:` records at one name → invalid.
 - [x] Non-`bitcoin:` `TXT` records ignored.
 - [x] Unknown `req-*` parameters → invalid.
