@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::resolver::ProfileResolver;
-use crate::ssrf::validate_url;
+use crate::ssrf::{pinned_client, resolve_and_validate, validate_url};
 use crate::{Result, SatsPathError, SignedPaymentProfile};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolves a profile by making an HTTP GET request to the domain of the alias.
 ///
@@ -13,7 +15,8 @@ use crate::{Result, SatsPathError, SignedPaymentProfile};
 /// `https://satspath.dev/.well-known/satspath/rodrigo`
 ///
 /// After fetching, the resolver:
-/// 1. **SSRF validation** — blocks requests to private/loopback/metadata IPs.
+/// 1. **SSRF validation** — resolves the host, blocks private/loopback/metadata
+///    addresses, and pins the connection to the validated addresses.
 /// 2. Verifies the profile signature (ECDSA secp256k1 over canonical JSON).
 /// 3. Checks the profile expiry (`expires_at` field).
 ///
@@ -27,7 +30,7 @@ impl HttpResolver {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(REQUEST_TIMEOUT)
                 // Disallow redirects to prevent open redirect → SSRF chains
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -83,7 +86,7 @@ impl HttpResolver {
             && parsed.password().is_none()
             && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
 
-        if is_test_build && is_local {
+        let client = if is_test_build && is_local {
             if let Some(port) = parsed.port() {
                 if matches!(port, 22 | 3306 | 5432 | 6379 | 27017) {
                     return Err(SatsPathError::ValidationError(format!(
@@ -91,11 +94,15 @@ impl HttpResolver {
                     )));
                 }
             }
+            self.client.clone()
         } else {
-            validate_url(url, false)?;
-        }
+            // SSRF-02: resolve the host, reject internal addresses, and pin
+            // the connection to the validated addresses (no DNS rebinding).
+            let target = resolve_and_validate(url, false).await?;
+            pinned_client(&target, REQUEST_TIMEOUT)?
+        };
 
-        let mut resp = self.client.get(url).send().await.map_err(|e| {
+        let mut resp = client.get(url).send().await.map_err(|e| {
             SatsPathError::NetworkError(format!("Failed to connect to {}: {}", url, e))
         })?;
 

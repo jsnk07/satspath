@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{client_async_tls, connect_async, tungstenite::Message};
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::peer_registry::canonicalize_identifier;
@@ -20,6 +20,7 @@ const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.primal.net",
 ];
 const NOSTR_TIMEOUT: Duration = Duration::from_secs(8);
+const NIP05_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Resolver for SatsPath profiles announced over Nostr.
 ///
@@ -33,7 +34,6 @@ const NOSTR_TIMEOUT: Duration = Duration::from_secs(8);
 /// Nostr event signatures identify the Nostr author. They do not replace the
 /// SatsPath profile signature, which is still the protocol authority.
 pub struct NostrResolver {
-    client: reqwest::Client,
     fallback_relays: Vec<String>,
 }
 
@@ -59,10 +59,6 @@ impl Default for NostrResolver {
 impl NostrResolver {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
             fallback_relays: env_relays().unwrap_or_else(|| {
                 DEFAULT_RELAYS
                     .iter()
@@ -74,10 +70,6 @@ impl NostrResolver {
 
     pub fn with_relays(relays: Vec<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(6))
-                .build()
-                .unwrap_or_default(),
             fallback_relays: relays,
         }
     }
@@ -88,8 +80,11 @@ impl NostrResolver {
             .split_once('@')
             .ok_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))?;
         let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
-        let document: Nip05Document = self
-            .client
+        // SSRF-02: the domain comes from an untrusted identifier. Resolve it,
+        // reject internal addresses, pin the connection, and refuse redirects.
+        let target = crate::ssrf::resolve_and_validate(&url, false).await?;
+        let client = crate::ssrf::pinned_client(&target, NIP05_TIMEOUT)?;
+        let document: Nip05Document = client
             .get(&url)
             .send()
             .await
@@ -161,7 +156,18 @@ impl NostrResolver {
         ]);
 
         let relay_result = timeout(NOSTR_TIMEOUT, async {
-            let (mut ws, _) = connect_async(relay)
+            // SSRF-02: relay hints come from the (untrusted) NIP-05 document.
+            // Resolve and validate the relay host, then connect the socket to
+            // a validated address so DNS cannot be re-pointed in between.
+            let target = crate::ssrf::resolve_and_validate(
+                &relay_http_url(relay)?,
+                relay.starts_with("ws://"),
+            )
+            .await?;
+            let stream = tokio::net::TcpStream::connect(target.addrs.as_slice())
+                .await
+                .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
+            let (mut ws, _) = client_async_tls(relay, stream)
                 .await
                 .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
             ws.send(Message::Text(req.to_string().into()))
@@ -311,6 +317,20 @@ fn event_has_tag(event: &Value, tag_name: &str, tag_value: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Map a `wss://` / `ws://` relay URL to the equivalent `https://` / `http://`
+/// URL so it can go through the SSRF guard.
+fn relay_http_url(relay: &str) -> Result<String> {
+    if let Some(rest) = relay.strip_prefix("wss://") {
+        Ok(format!("https://{rest}"))
+    } else if let Some(rest) = relay.strip_prefix("ws://") {
+        Ok(format!("http://{rest}"))
+    } else {
+        Err(SatsPathError::ValidationError(format!(
+            "unsupported relay URL scheme: {relay}"
+        )))
+    }
 }
 
 fn validate_nostr_pubkey(pubkey: &str) -> Result<()> {
