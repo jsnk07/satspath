@@ -1,13 +1,50 @@
 //! SSRF (Server-Side Request Forgery) protection for SatsPath resolvers.
 //!
-//! All outbound HTTP/HTTPS requests from resolvers MUST pass through
-//! [`validate_url`] before being issued. This prevents a malicious alias
-//! (e.g. `attacker@127.0.0.1`) from tricking the resolver into contacting
+//! All outbound HTTP/HTTPS requests from resolvers MUST go through
+//! [`resolve_and_validate`] + [`pinned_client`] (or, at minimum,
+//! [`validate_url`]) before being issued. This prevents a malicious alias
+//! (e.g. `attacker@127.0.0.1`, or `victim@attacker.example` whose A record
+//! points at `169.254.169.254`) from tricking the resolver into contacting
 //! internal services.
+//!
+//! # Why hostnames need resolving
+//!
+//! [`validate_url`] is a pure string check: it rejects IP literals in private
+//! ranges and hostnames that can only denote internal targets. It cannot know
+//! where an arbitrary public hostname points. [`resolve_and_validate`] resolves
+//! the hostname and rejects the request if *any* returned address is internal.
+//!
+//! # Why the connection must be pinned
+//!
+//! Validating one DNS answer and then letting the HTTP client resolve the name
+//! again at connect time leaves a time-of-check / time-of-use gap: a low-TTL
+//! record can pass validation and flip to an internal IP for the real request
+//! (DNS rebinding). [`pinned_client`] builds a client that connects only to the
+//! addresses that were validated, while TLS still verifies the hostname.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use crate::{Result, SatsPathError};
+
+/// DNS suffixes that can only name internal / special-use hosts
+/// (RFC 6761, RFC 6762, RFC 8375, and common internal-only conventions).
+const INTERNAL_SUFFIXES: &[&str] = &[
+    "localhost",
+    "localdomain",
+    "local",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "corp",
+    "home.arpa",
+    "in-addr.arpa",
+    "ip6.arpa",
+];
+
+/// Public DNS names that are well known to resolve to loopback.
+const LOOPBACK_ALIAS_DOMAINS: &[&str] = &["localtest.me", "lvh.me", "vcap.me", "lacolhost.com"];
 
 /// Domains that are always blocked regardless of IP resolution.
 const BLOCKED_HOSTS: &[&str] = &[
@@ -68,6 +105,11 @@ pub fn validate_url(url: &str, allow_http: bool) -> Result<()> {
                 "Blocked IP: {ip} (private/reserved range)"
             )));
         }
+    } else {
+        // Hostname: reject names that can only denote an internal target.
+        // This is defense in depth — the authoritative check is on the
+        // resolved addresses (see `resolve_and_validate`).
+        check_internal_hostname(host_clean)?;
     }
 
     // ── Port ──────────────────────────────────────────────────────────────
@@ -84,6 +126,135 @@ pub fn validate_url(url: &str, allow_http: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reject hostnames that can only denote an internal target: special-use
+/// suffixes, known loopback-alias domains, and wildcard-DNS names that embed a
+/// private IPv4 address (`10.0.0.1.nip.io`, `10-0-0-1.sslip.io`, ...).
+fn check_internal_hostname(host: &str) -> Result<()> {
+    let has_suffix = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
+
+    if let Some(suffix) = INTERNAL_SUFFIXES.iter().find(|s| has_suffix(s)) {
+        return Err(SatsPathError::ValidationError(format!(
+            "Blocked host: {host} (internal-only DNS suffix .{suffix})"
+        )));
+    }
+    if LOOPBACK_ALIAS_DOMAINS.iter().any(|d| has_suffix(d)) {
+        return Err(SatsPathError::ValidationError(format!(
+            "Blocked host: {host} (resolves to loopback)"
+        )));
+    }
+    if let Some(ip) = embedded_private_ipv4(host) {
+        return Err(SatsPathError::ValidationError(format!(
+            "Blocked host: {host} (embeds private/reserved address {ip})"
+        )));
+    }
+    Ok(())
+}
+
+/// Find a private/reserved IPv4 address embedded in a hostname, either as four
+/// consecutive numeric labels (`a.b.c.d.example`) or as one dash-separated
+/// label (`a-b-c-d.example`).
+fn embedded_private_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let labels: Vec<&str> = host.split('.').collect();
+
+    for window in labels.windows(4) {
+        if let Ok(ip) = window.join(".").parse::<Ipv4Addr>() {
+            if is_private_v4(ip) {
+                return Some(ip);
+            }
+        }
+    }
+    for label in &labels {
+        let parts: Vec<&str> = label.split('-').collect();
+        for window in parts.windows(4) {
+            if let Ok(ip) = window.join(".").parse::<Ipv4Addr>() {
+                if is_private_v4(ip) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check the addresses a hostname resolved to. Fails if the set is empty or if
+/// **any** address is private/reserved — the HTTP client may connect to any of
+/// them, so one internal address is enough to make the request unsafe.
+pub fn check_resolved_addrs(host: &str, addrs: &[IpAddr]) -> Result<()> {
+    if addrs.is_empty() {
+        return Err(SatsPathError::NetworkError(format!(
+            "{host} did not resolve to any address"
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|ip| is_private_or_reserved(**ip)) {
+        return Err(SatsPathError::ValidationError(format!(
+            "Blocked host: {host} resolves to {bad} (private/reserved range)"
+        )));
+    }
+    Ok(())
+}
+
+/// A URL target whose host has been resolved and validated.
+///
+/// Pass it to [`pinned_client`] so the request connects only to `addrs`.
+#[derive(Debug, Clone)]
+pub struct ValidatedTarget {
+    /// Host as it appears in the URL (used for TLS SNI / certificate checks).
+    pub host: String,
+    /// Validated socket addresses the request is allowed to connect to.
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// Validate `url` with [`validate_url`], resolve its host, and check every
+/// resolved address with [`check_resolved_addrs`].
+pub async fn resolve_and_validate(url: &str, allow_http: bool) -> Result<ValidatedTarget> {
+    validate_url(url, allow_http)?;
+
+    let parsed = url::Url::parse(url)
+        .map_err(|e| SatsPathError::ValidationError(format!("Invalid URL: {e}")))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| SatsPathError::ValidationError("URL has no port".into()))?;
+
+    let (host, ips): (String, Vec<IpAddr>) = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
+        Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
+        Some(url::Host::Domain(domain)) => {
+            let resolved = tokio::net::lookup_host((domain, port)).await.map_err(|e| {
+                SatsPathError::NetworkError(format!("DNS resolution failed for {domain}: {e}"))
+            })?;
+            let ips = resolved.map(|sa| sa.ip()).collect();
+            (domain.to_string(), ips)
+        }
+        None => return Err(SatsPathError::ValidationError("URL has no host".into())),
+    };
+
+    check_resolved_addrs(&host, &ips)?;
+
+    Ok(ValidatedTarget {
+        host,
+        addrs: ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect(),
+    })
+}
+
+/// Build an HTTP client that can only connect to the validated addresses of
+/// `target` and never follows redirects.
+///
+/// Pinning closes the DNS-rebinding gap between validation and connection.
+pub fn pinned_client(target: &ValidatedTarget, timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        // A redirect would re-enter resolution for a new, unvalidated host.
+        .redirect(reqwest::redirect::Policy::none())
+        // Proxies would make the pinned addresses meaningless.
+        .no_proxy()
+        .resolve_to_addrs(&target.host, &target.addrs)
+        .build()
+        .map_err(|e| SatsPathError::NetworkError(format!("failed to build HTTP client: {e}")))
 }
 
 /// Returns `true` if the IP address is in a private, loopback, link-local,
@@ -135,6 +306,22 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
     if octets[0] == 100 && (64..=127).contains(&octets[1]) {
         return true;
     }
+    // "This network": 0.0.0.0/8
+    if octets[0] == 0 {
+        return true;
+    }
+    // IETF protocol assignments: 192.0.0.0/24
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return true;
+    }
+    // Benchmarking: 198.18.0.0/15
+    if octets[0] == 198 && (18..=19).contains(&octets[1]) {
+        return true;
+    }
+    // Multicast 224.0.0.0/4 and reserved 240.0.0.0/4
+    if octets[0] >= 224 {
+        return true;
+    }
     false
 }
 
@@ -160,7 +347,31 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_private_v4(v4);
     }
+    // Multicast: ff00::/8
+    if segments[0] & 0xff00 == 0xff00 {
+        return true;
+    }
+    // Documentation: 2001:db8::/32
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 — check the embedded v4
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return is_private_v4(embedded_v4(segments[6], segments[7]));
+    }
+    // 6to4: 2002::/16 — the embedded v4 is in segments 1..=2
+    if segments[0] == 0x2002 {
+        return is_private_v4(embedded_v4(segments[1], segments[2]));
+    }
+    // Deprecated IPv4-compatible ::a.b.c.d
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return is_private_v4(embedded_v4(segments[6], segments[7]));
+    }
     false
+}
+
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
 }
 
 #[cfg(test)]
@@ -245,5 +456,90 @@ mod tests {
     #[test]
     fn carrier_grade_nat_blocked() {
         assert!(validate_url("https://100.100.100.100/profile", false).is_err());
+    }
+
+    #[test]
+    fn internal_suffix_hostnames_blocked() {
+        for host in [
+            "printer.local",
+            "metadata.internal",
+            "router.home.arpa",
+            "db.corp",
+            "nas.lan",
+            "x.localdomain",
+            "1.0.0.127.in-addr.arpa",
+        ] {
+            assert!(
+                validate_url(&format!("https://{host}/p"), false).is_err(),
+                "{host} must be blocked"
+            );
+        }
+        // Suffix match is on whole labels only.
+        assert!(validate_url("https://notlocal.com/p", false).is_ok());
+        assert!(validate_url("https://internal.example.com/p", false).is_ok());
+    }
+
+    #[test]
+    fn embedded_private_ipv4_blocked() {
+        assert!(validate_url("https://169.254.169.254.nip.io/p", false).is_err());
+        assert!(validate_url("https://a.10.1.2.3.sslip.io/p", false).is_err());
+        assert!(validate_url("https://app-127-0-0-1.sslip.io/p", false).is_err());
+        assert!(validate_url("https://localtest.me/p", false).is_err());
+        // A public IP embedded in a name is not, by itself, a reason to block.
+        assert!(validate_url("https://93.184.215.14.nip.io/p", false).is_ok());
+    }
+
+    #[test]
+    fn extended_reserved_ranges_blocked() {
+        for ip in [
+            "0.1.2.3",
+            "192.0.0.8",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+        ] {
+            assert!(is_private_or_reserved(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "ff02::1",
+            "2001:db8::1",
+            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254
+            "2002:7f00:1::",      // 6to4 → 127.0.0.1
+            "::7f00:1",           // IPv4-compatible 127.0.0.1
+        ] {
+            assert!(is_private_or_reserved(ip.parse().unwrap()), "{ip}");
+        }
+        assert!(!is_private_or_reserved("93.184.215.14".parse().unwrap()));
+        assert!(!is_private_or_reserved("2606:4700::1111".parse().unwrap()));
+        assert!(!is_private_or_reserved("64:ff9b::808:808".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolved_addresses_checked() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(check_resolved_addrs("h", &[ip("169.254.169.254")]).is_err());
+        assert!(check_resolved_addrs("h", &[ip("1.1.1.1"), ip("127.0.0.1")]).is_err());
+        assert!(check_resolved_addrs("h", &[]).is_err());
+        assert!(check_resolved_addrs("h", &[ip("1.1.1.1")]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_rejects_private_literal_before_lookup() {
+        assert!(resolve_and_validate("https://10.0.0.1/p", false)
+            .await
+            .is_err());
+        assert!(resolve_and_validate("https://localhost/p", false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_pins_public_literal() {
+        let target = resolve_and_validate("https://1.1.1.1/p", false)
+            .await
+            .unwrap();
+        assert_eq!(target.addrs, vec!["1.1.1.1:443".parse().unwrap()]);
+        assert!(pinned_client(&target, Duration::from_secs(1)).is_ok());
     }
 }
