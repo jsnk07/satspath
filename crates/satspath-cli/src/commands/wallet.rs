@@ -543,7 +543,7 @@ pub fn cmd_wallet_show(debug: bool) -> Result<()> {
         state
             .alias
             .as_deref()
-            .map(&mask_id)
+            .map(mask_id)
             .unwrap_or_else(|| "(not set)".into())
     );
     println!("Identity fingerprint: {}", fingerprint_pubkey(pubkey)?);
