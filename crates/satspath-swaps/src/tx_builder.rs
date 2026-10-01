@@ -3,6 +3,7 @@ use std::str::FromStr;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
     Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness,
@@ -28,7 +29,7 @@ pub struct ReverseClaimTxParams {
     pub claim_key_hex: String,
     /// Destination address where claimed funds will land.
     pub destination_address: String,
-    /// Optional redeem script hex (if SegWit/Taproot script path).
+    /// P2WSH HTLC witness script hex. Required: the claim cannot be signed without it.
     pub redeem_script_hex: Option<String>,
     /// Miner fee to deduct from the lockup amount (in sats, default 1,000).
     pub miner_fee_sats: u64,
@@ -51,7 +52,7 @@ pub struct SubmarineRefundTxParams {
     pub timeout_block_height: u32,
     /// Destination address where refunded funds will land.
     pub destination_address: String,
-    /// Optional redeem script hex.
+    /// P2WSH HTLC witness script hex. Required: the refund cannot be signed without it.
     pub redeem_script_hex: Option<String>,
     /// Miner fee to deduct from the lockup amount (in sats, default 1,000).
     pub miner_fee_sats: u64,
@@ -69,8 +70,11 @@ pub struct BuiltSwapTx {
 
 /// Build an on-chain Claim transaction for a confirmed Reverse swap.
 ///
-/// Spends the lockup UTXO by fulfilling the HTLC hash-lock (revealing the 32-byte preimage)
-/// and signing with the claim private key.
+/// Spends a P2WSH HTLC lockup UTXO by fulfilling the hash-lock (revealing the 32-byte
+/// preimage) and signing the BIP-143 sighash with the claim private key.
+///
+/// Only P2WSH HTLCs are supported. Boltz v2 Taproot swaps need a MuSig2 key-path or
+/// BIP-341 script-path spend, which this builder does not produce.
 pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<BuiltSwapTx> {
     if params.lockup_amount_sats <= params.miner_fee_sats {
         return Err(SwapError::Key(format!(
@@ -124,31 +128,21 @@ pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<BuiltSwapT
     let secp = Secp256k1::new();
     let claim_secret = SecretKey::from_slice(&claim_key_bytes)
         .map_err(|e| SwapError::Key(format!("Invalid claim secret key: {e}")))?;
-    let claim_pubkey = claim_secret.public_key(&secp);
 
-    // Witness stack for HTLC claim spend:
-    // [signature, preimage, redeem_script]
-    let redeem_script_bytes = if let Some(rs_hex) = params.redeem_script_hex {
-        hex::decode(rs_hex)
-            .map_err(|e| SwapError::Key(format!("Invalid redeem script hex: {e}")))?
-    } else {
-        // Synthesize minimal standard BIP-199 HTLC witness script if not explicitly provided
-        let mut script = Vec::new();
-        script.extend_from_slice(&claim_pubkey.serialize());
-        script
-    };
+    let redeem_script = decode_witness_script(params.redeem_script_hex.as_deref())?;
+    let sig_der = sign_p2wsh_input(
+        &tx,
+        &redeem_script,
+        params.lockup_amount_sats,
+        &claim_secret,
+        &secp,
+    )?;
 
-    // Create witness dummy signature or schnorr signature for the transaction
-    let sighash = tx.compute_txid();
-    let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_ecdsa(&msg, &claim_secret);
-    let mut sig_der = sig.serialize_der().to_vec();
-    sig_der.push(bitcoin::sighash::EcdsaSighashType::All.to_u32() as u8);
-
+    // Witness stack for P2WSH HTLC claim spend: [signature, preimage, witness_script]
     let mut witness = Witness::new();
     witness.push(sig_der);
     witness.push(preimage_bytes);
-    witness.push(redeem_script_bytes);
+    witness.push(redeem_script.as_bytes());
 
     tx.input[0].witness = witness;
 
@@ -166,7 +160,8 @@ pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<BuiltSwapT
 
 /// Build an on-chain Refund transaction for an expired Submarine swap.
 ///
-/// Spends the lockup UTXO after `timeout_block_height` using the client's refund private key.
+/// Spends a P2WSH HTLC lockup UTXO after `timeout_block_height`, signing the BIP-143
+/// sighash with the client's refund private key. Taproot lockups are not supported.
 pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<BuiltSwapTx> {
     if params.lockup_amount_sats <= params.miner_fee_sats {
         return Err(SwapError::Key(format!(
@@ -217,29 +212,22 @@ pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<Buil
     let secp = Secp256k1::new();
     let refund_secret = SecretKey::from_slice(&refund_key_bytes)
         .map_err(|e| SwapError::Key(format!("Invalid refund secret key: {e}")))?;
-    let refund_pubkey = refund_secret.public_key(&secp);
 
-    let redeem_script_bytes = if let Some(rs_hex) = params.redeem_script_hex {
-        hex::decode(rs_hex)
-            .map_err(|e| SwapError::Key(format!("Invalid redeem script hex: {e}")))?
-    } else {
-        let mut script = Vec::new();
-        script.extend_from_slice(&refund_pubkey.serialize());
-        script
-    };
-
-    let sighash = tx.compute_txid();
-    let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_ecdsa(&msg, &refund_secret);
-    let mut sig_der = sig.serialize_der().to_vec();
-    sig_der.push(bitcoin::sighash::EcdsaSighashType::All.to_u32() as u8);
+    let redeem_script = decode_witness_script(params.redeem_script_hex.as_deref())?;
+    let sig_der = sign_p2wsh_input(
+        &tx,
+        &redeem_script,
+        params.lockup_amount_sats,
+        &refund_secret,
+        &secp,
+    )?;
 
     // Witness stack for refund:
     // [signature, 0, redeem_script] (CLTV branch)
     let mut witness = Witness::new();
     witness.push(sig_der);
     witness.push(vec![]); // 0 pushes false to select the timeout branch
-    witness.push(redeem_script_bytes);
+    witness.push(redeem_script.as_bytes());
 
     tx.input[0].witness = witness;
 
@@ -253,6 +241,43 @@ pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<Buil
         output_amount_sats: net_output_sats,
         fee_sats: params.miner_fee_sats,
     })
+}
+
+/// Decode the HTLC witness script. A missing script is an error: signing against a
+/// synthesized script would produce a spend that can never be valid on-chain.
+fn decode_witness_script(redeem_script_hex: Option<&str>) -> Result<ScriptBuf> {
+    let rs_hex = redeem_script_hex
+        .ok_or_else(|| SwapError::Key("Redeem script missing: cannot sign HTLC spend".into()))?;
+    let bytes = hex::decode(rs_hex)
+        .map_err(|e| SwapError::Key(format!("Invalid redeem script hex: {e}")))?;
+    if bytes.is_empty() {
+        return Err(SwapError::Key("Redeem script is empty".into()));
+    }
+    Ok(ScriptBuf::from_bytes(bytes))
+}
+
+/// Sign input 0 of `tx` as a P2WSH spend using the BIP-143 segwit v0 sighash,
+/// returning a DER signature with the SIGHASH_ALL byte appended.
+fn sign_p2wsh_input(
+    tx: &Transaction,
+    witness_script: &ScriptBuf,
+    prevout_amount_sats: u64,
+    secret: &SecretKey,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<Vec<u8>> {
+    let sighash = SighashCache::new(tx)
+        .p2wsh_signature_hash(
+            0,
+            witness_script,
+            Amount::from_sat(prevout_amount_sats),
+            EcdsaSighashType::All,
+        )
+        .map_err(|e| SwapError::Key(format!("Sighash computation failed: {e}")))?;
+    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, secret);
+    let mut sig_der = sig.serialize_der().to_vec();
+    sig_der.push(EcdsaSighashType::All.to_u32() as u8);
+    Ok(sig_der)
 }
 
 /// Helper to build claim parameters directly from a persisted SwapRecord.
@@ -333,7 +358,7 @@ mod tests {
             claim_key_hex: "0101010101010101010101010101010101010101010101010101010101010101"
                 .into(),
             destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
-            redeem_script_hex: None,
+            redeem_script_hex: Some("6352670068".into()),
             miner_fee_sats: 1_200,
         };
 
@@ -359,7 +384,7 @@ mod tests {
                 .into(),
             timeout_block_height: 850_000,
             destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
-            redeem_script_hex: None,
+            redeem_script_hex: Some("6352670168".into()),
             miner_fee_sats: 1_500,
         };
 
@@ -370,5 +395,50 @@ mod tests {
         assert_eq!(built.transaction.output[0].value.to_sat(), 98_500);
         assert_eq!(built.transaction.input[0].witness.len(), 3);
         assert_eq!(built.txid.len(), 64);
+    }
+
+    fn claim_params(redeem_script_hex: Option<String>) -> ReverseClaimTxParams {
+        ReverseClaimTxParams {
+            swap_id: "swap_rev_sig".into(),
+            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000003".into(),
+            lockup_vout: 0,
+            lockup_amount_sats: 60_000,
+            preimage_hex: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".into(),
+            claim_key_hex: "0303030303030303030303030303030303030303030303030303030303030303"
+                .into(),
+            destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
+            redeem_script_hex,
+            miner_fee_sats: 1_000,
+        }
+    }
+
+    #[test]
+    fn claim_signature_commits_to_bip143_sighash() {
+        let script = ScriptBuf::from_bytes(hex::decode("6352670068").unwrap());
+        let built =
+            build_reverse_claim_tx(claim_params(Some("6352670068".into()))).expect("build claim");
+
+        let mut unsigned = built.transaction.clone();
+        unsigned.input[0].witness = Witness::new();
+        let sighash = SighashCache::new(&unsigned)
+            .p2wsh_signature_hash(0, &script, Amount::from_sat(60_000), EcdsaSighashType::All)
+            .unwrap();
+        let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+
+        let sig_bytes = built.transaction.input[0].witness.nth(0).unwrap();
+        let (sighash_byte, der) = sig_bytes.split_last().unwrap();
+        assert_eq!(*sighash_byte, EcdsaSighashType::All.to_u32() as u8);
+        let sig = bitcoin::secp256k1::ecdsa::Signature::from_der(der).unwrap();
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        secp.verify_ecdsa(&msg, &sig, &sk.public_key(&secp))
+            .expect("signature must verify against the segwit v0 sighash");
+    }
+
+    #[test]
+    fn claim_without_redeem_script_is_rejected() {
+        let err = build_reverse_claim_tx(claim_params(None)).unwrap_err();
+        assert!(err.to_string().contains("Redeem script missing"));
     }
 }

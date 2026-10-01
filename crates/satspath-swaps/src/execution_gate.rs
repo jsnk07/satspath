@@ -1,9 +1,15 @@
 use crate::errors::{Result, SwapError};
 use crate::types::SwapKind;
 
+/// Whether SatsPath can build and broadcast a consensus-valid claim/refund for `kind`.
+///
+/// Boltz v2 swaps lock funds in Taproot outputs. Claiming or refunding them needs a
+/// MuSig2 cooperative key-path spend or a BIP-341 script-path spend plus a broadcast
+/// path; `tx_builder` only signs P2WSH HTLCs and nothing broadcasts. Until that exists
+/// every kind stays blocked so no execution flow can lock funds it cannot recover.
 pub fn claim_refund_builders_available(kind: SwapKind) -> bool {
     match kind {
-        SwapKind::Submarine | SwapKind::Reverse | SwapKind::Chain => true,
+        SwapKind::Submarine | SwapKind::Reverse | SwapKind::Chain => false,
     }
 }
 
@@ -22,9 +28,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execution_allowed_when_claim_refund_builder_available() {
-        assert!(ensure_claim_refund_builders_available(SwapKind::Submarine).is_ok());
-        assert!(ensure_claim_refund_builders_available(SwapKind::Reverse).is_ok());
-        assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_ok());
+    fn execution_blocked_until_taproot_claim_refund_exists() {
+        assert!(ensure_claim_refund_builders_available(SwapKind::Submarine).is_err());
+        assert!(ensure_claim_refund_builders_available(SwapKind::Reverse).is_err());
+        assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_err());
     }
 }

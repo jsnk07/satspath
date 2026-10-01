@@ -202,21 +202,18 @@ pub async fn wait_and_claim_reverse(
 /// The cooperative path produces a standard Schnorr signature, minimizing
 /// on-chain footprint and improving privacy.
 ///
-/// TODO (Phase 4b): Implement full Taproot claim tx with `bitcoin` crate.
+/// Not implemented: there is no Taproot claim builder and no broadcast path, so this
+/// fails closed rather than recording a claim that never reached the chain. The swap
+/// stays `TransactionConfirmed` with its preimage and claim key persisted for recovery.
 fn build_and_broadcast_claim(record: &SwapRecord) -> Result<String> {
-    let destination = record
-        .destination_address
+    record
+        .lockup_txid
         .as_deref()
-        .ok_or_else(|| SwapError::Key("Destination address missing from swap record".into()))?;
+        .ok_or_else(|| SwapError::Key("Lockup txid missing from swap record".into()))?;
 
-    let lockup_txid = record.lockup_txid.clone().unwrap_or_else(|| {
-        "0000000000000000000000000000000000000000000000000000000000000001".to_string()
-    });
-
-    let params = crate::tx_builder::claim_params_from_record(record, &lockup_txid, 0, destination)?;
-
-    let built = crate::tx_builder::build_reverse_claim_tx(params)?;
-    Ok(built.txid)
+    Err(SwapError::Key(
+        "Taproot claim broadcast not yet implemented — secrets preserved for recovery".into(),
+    ))
 }
 
 #[cfg(test)]

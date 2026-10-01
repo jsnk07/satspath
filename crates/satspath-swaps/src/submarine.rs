@@ -145,8 +145,14 @@ pub async fn wait_submarine(
         }
         SwapStatus::InvoiceFailedToPay => {
             // Attempt automatic refund
-            let refund_txid = attempt_submarine_refund(client, store, swap_id).await;
-            store.update_status(swap_id, SwapStatus::TransactionRefunded, refund_txid.ok())?;
+            // Only record a refund that actually happened; otherwise keep the failure
+            // status so the swap remains visibly recoverable.
+            match attempt_submarine_refund(client, store, swap_id).await {
+                Ok(txid) => {
+                    store.update_status(swap_id, SwapStatus::TransactionRefunded, Some(txid))?
+                }
+                Err(_) => store.update_status(swap_id, SwapStatus::InvoiceFailedToPay, None)?,
+            }
             Err(SwapError::InvoiceFailedToPay {
                 id: swap_id.to_string(),
             })
@@ -165,12 +171,9 @@ pub async fn wait_submarine(
 
 /// Attempt to broadcast a refund transaction for a failed submarine swap.
 ///
-/// Returns the refund TXID on success.
-///
-/// Note: Full HTLC / Taproot refund transaction construction requires the
-/// `bitcoin` crate and the redeem script from the swap record. This function
-/// provides the scaffolding; the transaction signing is implemented in
-/// `tx_builder.rs` (Phase 4b follow-up).
+/// Returns the refund TXID on success. Not implemented yet: `tx_builder` only signs
+/// P2WSH HTLCs, which cannot spend Boltz v2 Taproot lockups, and nothing broadcasts,
+/// so this fails closed instead of reporting a refund that never reached the chain.
 async fn attempt_submarine_refund(
     _client: &BoltzClient,
     store: &SwapStore,
@@ -180,21 +183,14 @@ async fn attempt_submarine_refund(
         .get(swap_id)?
         .ok_or_else(|| SwapError::NotFound(swap_id.to_string()))?;
 
-    let destination = record
-        .destination_address
+    record
+        .lockup_txid
         .as_deref()
-        .or(record.lockup_address.as_deref())
-        .ok_or_else(|| SwapError::Key("Destination address missing from swap record".into()))?;
+        .ok_or_else(|| SwapError::Key("Lockup txid missing from swap record".into()))?;
 
-    let lockup_txid = record.lockup_txid.clone().unwrap_or_else(|| {
-        "0000000000000000000000000000000000000000000000000000000000000002".to_string()
-    });
-
-    let params =
-        crate::tx_builder::refund_params_from_record(&record, &lockup_txid, 0, destination)?;
-
-    let built = crate::tx_builder::build_submarine_refund_tx(params)?;
-    Ok(built.txid)
+    Err(SwapError::Key(
+        "Taproot refund broadcast not yet implemented — refund key preserved for recovery".into(),
+    ))
 }
 
 #[cfg(test)]
