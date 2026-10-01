@@ -92,7 +92,7 @@ fn test_attack_pqc_downgrade() {
         !verification_result,
         "SECURITY FAILURE: The node accepted a downgraded PQC profile!"
     );
-    println!("🛡️ DEFENSE SUCCESS: Cryptographic downgrade is impossible. The Schnorr signature covers the PQC flag and explicitly rejected the modification.");
+    println!("🛡️ DEFENSE SUCCESS: Cryptographic downgrade rejected. The Schnorr signature covers the canonical profile including the PQC flag and explicitly rejects modified payloads.");
 }
 
 #[tokio::test]
@@ -113,5 +113,5 @@ async fn test_attack_dns_spoofing() {
         "SECURITY FAILURE: DNSSEC is disabled! The protocol is vulnerable to spoofing."
     );
 
-    println!("🛡️ DEFENSE SUCCESS: DNSSEC validation is strictly enforced by default (`opts.validate = true`). Untrusted DNS responses will be rejected by the protocol layer.");
+    println!("🛡️ DEFENSE SUCCESS: Strict DNSSEC policy rejected the unauthenticated result. The default DoH backend does not independently validate DNSSEC, so Strict mode fails closed unless authenticated DNSSEC evidence is available.");
 }
