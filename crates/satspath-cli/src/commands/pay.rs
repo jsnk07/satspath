@@ -65,6 +65,13 @@ pub async fn cmd_pay(
         println!();
     }
 
+    // BIP-353 names (₿user@domain) resolve to a DNSSEC-authenticated payment
+    // instruction, not to a SatsPath profile signed by an identity key. They
+    // get their own path so they are never presented as a verified signature.
+    if alias.trim_start().starts_with('₿') {
+        return pay_bip353(alias, amount_sats, debug).await;
+    }
+
     let display_alias = if debug {
         alias.to_string()
     } else {
@@ -164,6 +171,49 @@ pub async fn cmd_pay(
         exec_experimental(&quote.swap_directive, amount_sats, alias, debug, &executor).await?;
     }
 
+    for line in preview_safety_lines() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Preview a payment to a BIP-353 name.
+///
+/// The instruction is authenticated by DNSSEC (Strict policy: an unvalidated
+/// record fails closed). It is NOT signed by a SatsPath identity key, and this
+/// output says so explicitly.
+async fn pay_bip353(name: &str, amount_sats: u64, debug: bool) -> Result<()> {
+    let display_name = if debug {
+        name.to_string()
+    } else {
+        mask_identifier(name)
+    };
+    println!("Resolving BIP-353 name {}...", display_name);
+
+    let resolution = satspath_core::resolvers::bip353::Bip353Resolver::new()
+        .resolve_instruction(name)
+        .await
+        .map_err(|e| anyhow::anyhow!("BIP-353 resolution failed (fail closed): {}", e))?;
+
+    println!("  DNSSEC: validated.");
+    println!("  Identity: NOT a SatsPath-signed profile.");
+    println!("    BIP-353 proves this instruction was published in the DNS zone of");
+    println!("    the domain. It is not signed by the recipient's identity key.");
+    for warning in &resolution.warnings {
+        println!("  {}", warning);
+    }
+    println!();
+    let uri = if debug {
+        resolution.bitcoin_uri.clone()
+    } else {
+        satspath_core::privacy::mask_invoice(&resolution.bitcoin_uri)
+    };
+    println!("Payment instruction: {}", uri);
+    println!(
+        "Amount:              {} sats (enter it in your own wallet)",
+        amount_sats
+    );
+    println!();
     for line in preview_safety_lines() {
         println!("{line}");
     }

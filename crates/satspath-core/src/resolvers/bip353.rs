@@ -1,16 +1,41 @@
+//! BIP-353 adapter for the resolver chain.
+//!
+//! A BIP-353 name (`₿alice@example.com`) resolves to a DNSSEC-signed
+//! `bitcoin:` URI. That is a *payment instruction* authenticated by DNSSEC —
+//! it is **not** a SatsPath profile signed by the recipient's identity key.
+//!
+//! An earlier version of this resolver parsed the TXT record, generated a
+//! fresh random keypair, and self-signed a synthetic profile with it. The
+//! `pay` command then verified that self-signature and printed
+//! "Signature valid.", presenting an unauthenticated DNS answer as a verified
+//! identity. The signature attested nothing about the recipient.
+//!
+//! This resolver therefore:
+//! * delegates resolution to [`crate::bip353::resolve_bip353_with`] under
+//!   [`DnssecPolicy::Strict`], which fails closed on any record that was not
+//!   DNSSEC-validated, rejects multiple `bitcoin:` records, reconstructs
+//!   multi-string TXT records correctly and validates the BIP-321 URI;
+//! * exposes the result as a [`Bip353Resolution`] via
+//!   [`Bip353Resolver::resolve_instruction`];
+//! * never fabricates a key or signature. As a [`ProfileResolver`] it refuses
+//!   `₿` names with an explicit error instead of returning a "signed" profile.
+
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioAsyncResolver;
-use secp256k1::{rand, Keypair, Secp256k1};
 
-use crate::profile::{PaymentMethod, PaymentProfile};
+use crate::bip353::{
+    resolve_bip353_with, Bip353Resolution, DnsTxtRecord, DnsTxtResolver, DnssecPolicy,
+};
 use crate::resolver::ProfileResolver;
 use crate::{Result, SatsPathError, SignedPaymentProfile};
 
+/// Resolves BIP-353 names to DNSSEC-authenticated payment instructions.
 pub struct Bip353Resolver {
-    dnssec_required: bool,
-    resolver: TokioAsyncResolver,
+    dns: Arc<dyn DnsTxtResolver + Send + Sync>,
 }
 
 impl Default for Bip353Resolver {
@@ -20,147 +45,109 @@ impl Default for Bip353Resolver {
 }
 
 impl Bip353Resolver {
+    /// Resolver backed by a local, DNSSEC-validating DNS client.
     pub fn new() -> Self {
-        let mut opts = ResolverOpts::default();
-        opts.validate = true; // Enforce DNSSEC
-        let resolver = TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), opts);
-        Self {
-            dnssec_required: true,
-            resolver,
-        }
+        Self::with_dns_resolver(Arc::new(HickoryDnssecTxtResolver::new()))
     }
 
+    /// Resolver backed by a caller-supplied TXT backend (tests, custom DNS).
+    pub fn with_dns_resolver(dns: Arc<dyn DnsTxtResolver + Send + Sync>) -> Self {
+        Self { dns }
+    }
+
+    /// DNSSEC is always required; there is no insecure mode on this path.
     pub fn dnssec_required(&self) -> bool {
-        self.dnssec_required
+        true
+    }
+
+    /// Resolve `name` to its DNSSEC-validated `bitcoin:` payment instruction.
+    ///
+    /// Fails closed ([`SatsPathError::DnssecUnavailable`]) if the record was
+    /// not DNSSEC-validated.
+    pub async fn resolve_instruction(&self, name: &str) -> Result<Bip353Resolution> {
+        let now = chrono::Utc::now().timestamp();
+        resolve_bip353_with(self.dns.as_ref(), name, DnssecPolicy::Strict, now).await
     }
 }
 
 #[async_trait]
 impl ProfileResolver for Bip353Resolver {
     async fn resolve_alias(&self, alias: &str) -> Result<SignedPaymentProfile> {
-        if !alias.starts_with('₿') {
+        if !alias.trim_start().starts_with('₿') {
             return Err(SatsPathError::AliasNotFound(alias.to_string()));
         }
+        // A BIP-353 record carries no SatsPath identity key, so there is no
+        // honest way to return a *signed* profile for it. Refuse explicitly
+        // rather than fabricate a signature.
+        Err(SatsPathError::Bip353(
+            "BIP-353 names resolve to DNSSEC-authenticated payment instructions, not to \
+             signed SatsPath profiles; use Bip353Resolver::resolve_instruction \
+             (`satspath dns resolve`)"
+                .into(),
+        ))
+    }
+}
 
-        let clean_alias = alias.trim_start_matches('₿');
-        let parts: Vec<&str> = clean_alias.split('@').collect();
-        if parts.len() != 2 {
-            return Err(SatsPathError::AliasNotFound(alias.to_string()));
+/// TXT backend using hickory's DNSSEC-validating resolver.
+///
+/// With `validate = true`, hickory-resolver 0.24 wraps the connection in its
+/// DNSSEC handle, which verifies every RRset against a chain of trust rooted
+/// in the IANA trust anchor, **drops any RRset that does not validate**, and
+/// returns an error when nothing validates (so unsigned zones fail too).
+/// Records that reach this function have therefore been validated locally —
+/// not merely flagged by an upstream resolver's AD bit.
+///
+/// The resolver honours the strict contract of [`DnsTxtResolver`]: it reports
+/// `dnssec_validated = true` only when validation is enabled.
+pub struct HickoryDnssecTxtResolver {
+    resolver: TokioAsyncResolver,
+    validating: bool,
+}
+
+impl Default for HickoryDnssecTxtResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HickoryDnssecTxtResolver {
+    pub fn new() -> Self {
+        let mut opts = ResolverOpts::default();
+        opts.validate = true;
+        Self {
+            resolver: TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), opts),
+            validating: true,
         }
+    }
+}
 
-        let username = parts[0];
-        let domain = parts[1];
-        let lookup_domain = format!("{username}.user._bitcoin-payment.{domain}");
-
+#[async_trait]
+impl DnsTxtResolver for HickoryDnssecTxtResolver {
+    async fn query_txt(&self, fqdn: &str) -> Result<Vec<DnsTxtRecord>> {
         let lookup = self
             .resolver
-            .lookup(lookup_domain, RecordType::TXT)
+            .lookup(fqdn, RecordType::TXT)
             .await
             .map_err(|e| SatsPathError::NetworkError(format!("BIP-353 DNS lookup failed: {e}")))?;
 
-        // Find the first valid bitcoin: URI
-        let mut payment_uri = None;
-        for rdata in lookup.iter() {
-            if let Some(txt) = rdata.as_txt() {
-                for txt_data in txt.iter() {
-                    let txt_str = String::from_utf8_lossy(txt_data);
-                    if txt_str.starts_with("bitcoin:") {
-                        payment_uri = Some(txt_str.to_string());
-                        break;
-                    }
-                }
-            }
-            if payment_uri.is_some() {
-                break;
-            }
-        }
-
-        let uri = payment_uri.ok_or_else(|| {
-            SatsPathError::AliasNotFound("No valid BIP-353 bitcoin URI found in TXT records".into())
-        })?;
-
-        // Parse standard BIP-353 URI into methods
-        let mut methods = Vec::new();
-
-        // Extract base address (Onchain)
-        let mut uri_parts = uri.split('?');
-        let base = uri_parts
-            .next()
-            .unwrap_or("")
-            .trim_start_matches("bitcoin:");
-        if !base.is_empty() && base != "bc1q" {
-            methods.push(PaymentMethod::Onchain {
-                label: "BIP-353 Onchain".into(),
-                network: crate::pointer::BitcoinNetwork::Mainnet,
-                address: Some(base.to_string()),
-                silent_payment_pubkey: None,
-                pubkey_hint: None,
-                descriptor_hint: None,
-                address_list: vec![],
+        let mut out = Vec::new();
+        for record in lookup.record_iter() {
+            let Some(txt) = record.data().and_then(|d| d.as_txt()) else {
+                continue;
+            };
+            // Keep each record's character-strings separate and in order;
+            // `DnsTxtRecord::reconstruct` concatenates them (never across
+            // records), as BIP-353 requires.
+            let strings = txt
+                .iter()
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            out.push(DnsTxtRecord {
+                strings,
+                dnssec_validated: self.validating,
+                ttl_seconds: Some(record.ttl()),
             });
         }
-
-        // Extract query parameters (Lightning)
-        if let Some(query) = uri_parts.next() {
-            let mut lno = None;
-            let mut b12 = None;
-
-            for param in query.split('&') {
-                if let Some((k, v)) = param.split_once('=') {
-                    match k {
-                        "lno" => lno = Some(v.to_string()),
-                        "b12" => b12 = Some(v.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-
-            let bolt12_offer = b12
-                .filter(|s| !s.is_empty())
-                .or_else(|| lno.filter(|s| !s.is_empty()));
-            if let Some(offer) = bolt12_offer {
-                methods.push(PaymentMethod::Lightning {
-                    label: "BIP-353 Lightning".into(),
-                    lightning_address: None,
-                    lnurl: None, // technically lno could be an lnurl or LN address, but keeping simple
-                    bolt12: Some(offer),
-                    receiver_pubkey: None,
-                });
-            }
-        }
-
-        if methods.is_empty() {
-            return Err(SatsPathError::AliasNotFound(
-                "BIP-353 URI contained no valid methods".into(),
-            ));
-        }
-
-        let secp = Secp256k1::new();
-        let kp = Keypair::new(&secp, &mut rand::thread_rng());
-
-        let profile = PaymentProfile {
-            alias: alias.to_string(),
-            identity_pubkey: kp.public_key().to_string(),
-            methods,
-            updated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            expires_at: None,
-            sequence: Some(1),
-            preferences: vec![],
-            nonce: None,
-            rotation: None,
-            method_verifications: vec![],
-            hybrid_pubkey: None,
-            pqc_required: false,
-            revoked: false,
-        };
-
-        let signed = crate::crypto::sign_profile(profile, &kp.secret_key()).map_err(|e| {
-            SatsPathError::SerializationError(format!("failed to sign synthetic profile: {e}"))
-        })?;
-
-        Ok(signed)
+        Ok(out)
     }
 }
