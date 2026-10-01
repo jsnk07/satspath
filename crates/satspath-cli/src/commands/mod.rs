@@ -56,12 +56,31 @@ pub(crate) fn open_registry() -> Result<Registry> {
     Ok(Registry::open(&dir)?)
 }
 
+use satspath_core::key_pins::{FileKeyStore, MemoryKeyStore, PinnedResolver, TrustedKeyStore};
 use satspath_core::resolver::ChainResolver;
 use satspath_core::resolvers::bip353::Bip353Resolver;
 use satspath_core::resolvers::http::HttpResolver;
 use satspath_core::resolvers::nostr::NostrResolver;
+use std::sync::Arc;
 
-pub(crate) fn get_resolver() -> Result<ChainResolver> {
+/// The resolver every command uses: the transport chain wrapped in key
+/// continuity enforcement, so a resolved profile is bound to the identity key
+/// already trusted for that alias (TOFU pin, or an authorized rotation).
+pub(crate) fn get_resolver() -> Result<PinnedResolver<ChainResolver>> {
+    let dir = satspath_dir();
+    let store: Arc<dyn TrustedKeyStore> = if dir.exists() {
+        Arc::new(FileKeyStore::open(&dir)?)
+    } else {
+        eprintln!(
+            "Warning: .satspath/ not found — key pins will not persist across runs. \
+             Run `satspath init` to enable key continuity checks."
+        );
+        Arc::new(MemoryKeyStore::new())
+    };
+    Ok(PinnedResolver::new(build_chain(), store))
+}
+
+fn build_chain() -> ChainResolver {
     let mut chain = ChainResolver::new();
 
     // Add local registry first
@@ -75,5 +94,5 @@ pub(crate) fn get_resolver() -> Result<ChainResolver> {
     chain = chain.push(HttpResolver::new());
     chain = chain.push(NostrResolver::new());
 
-    Ok(chain)
+    chain
 }

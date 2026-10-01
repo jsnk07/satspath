@@ -3,9 +3,9 @@ use anyhow::Result;
 use satspath_core::{
     create_invite_record,
     crypto::verify_signed_profile,
+    key_pins::KeyContinuity,
     pointer::build_qr_payload,
     privacy::{mask_address, mask_identifier, mask_invoice, mask_pubkey},
-    resolver::ProfileResolver,
     validation::{
         assert_no_private_material, validate_amount_sats, validate_bitcoin_address,
         validate_compressed_pubkey, validate_lightning_address, LARGE_PREVIEW_AMOUNT_SATS,
@@ -73,8 +73,17 @@ pub async fn cmd_pay(
 
     println!("Resolving identifier {}...", display_alias);
     let resolver = get_resolver()?;
-    let signed = match resolver.resolve_alias(alias).await {
-        Ok(signed) => signed,
+    let (signed, continuity) = match resolver.resolve_with_continuity(alias).await {
+        Ok(resolved) => resolved,
+        Err(SatsPathError::UnauthorizedKeyReplacement) => {
+            anyhow::bail!(
+                "SECURITY: the identity key for {} changed without an authorization signed \
+                 by the key you trusted before. This is what a key-substitution attack looks \
+                 like. Aborting preview. If the recipient really replaced their key, confirm \
+                 the new key with them out of band before trusting it.",
+                display_alias
+            );
+        }
         Err(SatsPathError::AliasNotFound(_)) => {
             let invite = create_invite_record(
                 alias,
@@ -94,6 +103,18 @@ pub async fn cmd_pay(
         Err(e) => return Err(anyhow::anyhow!("{}", e)),
     };
     println!("  Found signed profile.");
+    match &continuity {
+        KeyContinuity::FirstUse => println!(
+            "  Key continuity: FIRST CONTACT — key {} pinned (trust on first use).",
+            mask_pubkey(&signed.profile.identity_pubkey)
+        ),
+        KeyContinuity::Matches => println!("  Key continuity: matches previously trusted key."),
+        KeyContinuity::Rotated { previous_pubkey } => println!(
+            "  Key continuity: ROTATED from {} with an authorization signed by the trusted key.",
+            mask_pubkey(previous_pubkey)
+        ),
+        KeyContinuity::NotApplicable => {}
+    }
 
     println!("Verifying signed profile...");
     if !verify_signed_profile(&signed)? {

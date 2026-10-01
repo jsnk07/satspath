@@ -20,6 +20,8 @@ pub mod transparency;
 pub mod validation;
 
 #[cfg(feature = "std")]
+pub mod key_pins;
+#[cfg(feature = "std")]
 pub mod resolver;
 #[cfg(feature = "std")]
 pub mod resolvers;
