@@ -51,7 +51,7 @@ The following feature branches have been merged directly into `main`:
 | Private material rejection (`xprv`, seeds) | [`validation.rs`](../crates/satspath-core/src/validation.rs) | ✅ Complete |
 | Bitcoin address network validation | [`validation.rs`](../crates/satspath-core/src/validation.rs) | ✅ Complete |
 | Lightning address & BOLT12 validation | [`validation.rs`](../crates/satspath-core/src/validation.rs) | ✅ Complete |
-| SSRF defensive filtering & port allowlist | [`ssrf.rs`](../crates/satspath-core/src/ssrf.rs) | ✅ Complete |
+| SSRF filtering: resolved-address checks, connection pinning (anti DNS-rebinding), port allowlist | [`ssrf.rs`](../crates/satspath-core/src/ssrf.rs) | ✅ Complete |
 | Cryptographic method ownership proofs | [`ownership.rs`](../crates/satspath-core/src/ownership.rs) | ✅ Complete |
 | Universal request codec & payment pointers | [`codec.rs`](../crates/satspath-core/src/codec.rs), [`pointer.rs`](../crates/satspath-core/src/pointer.rs) | ✅ Complete |
 
