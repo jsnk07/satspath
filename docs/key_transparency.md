@@ -4,7 +4,7 @@
 
 `self-signed profile != authenticated human-readable identity`. A malicious registry can replace Alice's key with an attacker key and return a profile correctly self-signed by that attacker. Profile-signature validity alone cannot detect the substitution.
 
-V1 adds a per-identifier hash chain inside a global append-only Merkle log, signed checkpoints, client pinning, dual-signature rotation, identifier-to-key attestations and an opt-in Bitcoin Core regtest anchor. The authenticated current-state map is not implemented: state is replayed from the log and `map_root` is `null`.
+V1/V2 adds a per-identifier hash chain inside a global append-only Merkle log, signed checkpoints, client pinning, dual-signature rotation, identifier-to-key attestations, an authenticated current-state map (Sparse Merkle non-inclusion proofs), witness quorum cosigning, and an opt-in Bitcoin Core regtest anchor. State is replayed deterministically from the log, with non-inclusion proofs cryptographically verified against the signed checkpoint `map_root`.
 
 ## Event creation and Merkle construction
 
@@ -78,7 +78,7 @@ flowchart LR
   D -->|valid| U[Atomic pin update]
 ```
 
-Pins are indexed by a stable deployment `log_id`, never by an untrusted newly presented key. An operator key change requires a dual-signed `OperatorKeyRotation` bound to `log_id`, predecessor checkpoint hash and sequence. The operator signs every checkpoint field, including an optional Bitcoin receipt. `checkpoint_hash` excludes the signature and receipt to avoid a txid/checkpoint circular commitment; the post-anchor signature commits to the receipt. Operator signatures create attributable evidence, but global gossip remains future work. First contact is TOFU unless independently compared.
+Pins are indexed by a stable deployment `log_id`, never by an untrusted newly presented key. An operator key change requires a dual-signed `OperatorKeyRotation` bound to `log_id`, predecessor checkpoint hash and sequence. The operator signs every checkpoint field, including an optional Bitcoin receipt. `checkpoint_hash` excludes the signature and receipt to avoid a txid/checkpoint circular commitment; the post-anchor signature commits to the receipt. Operator signatures create attributable evidence, and $K$-of-$N$ witness quorums mitigate single-operator split views, but universal peer-to-peer gossip remains future work. First contact relies on Trust-On-First-Use (TOFU) or independent out-of-band checkpoint comparison: TOFU detects subsequent rollbacks and forks after the initial pin, but cannot detect an adversarial first contact unless corroborated by independent witnesses or out-of-band fingerprints. Future cross-witness gossip can reduce first-contact consistency risk and improve split-view detection, but does not by itself authenticate the initial namespace-to-key binding without out-of-band verification.
 
 ## Identifier attestations
 
@@ -135,14 +135,20 @@ Read APIs cover status, paginated events/checkpoints, identifier/event/checkpoin
 
 ## Threats and limitations
 
-- Initial registration still needs an external identity attestation.
-- First contact is TOFU unless a checkpoint/key fingerprint is independently verified.
+- Initial registration still needs a verifiable binding to the human-readable namespace.
+- First contact is TOFU unless the namespace-to-key binding is independently verified out-of-band or confirmed through a trusted identity anchor. Witness quorums improve consistency and split-view detection but do not by themselves authenticate the initial binding.
 - A compromised verifier can attest a false binding.
-- A compromised current key can update, revoke or authorize rotation; transparency makes this visible but cannot undo it.
-- A lost key has no recovery in V1. Email recovery reduces security to the email provider.
-- A malicious operator can attempt split views; pinning detects local rollback/conflict, while gossip is future work.
-- Bitcoin provides auditable evidence; unrelated OP_RETURNs do not provide Catena's single-history property.
-- An authenticated current-state/non-inclusion map remains future work.
-- This is experimental and unaudited. Do not use it with real funds.
+- A compromised current key can update, revoke or authorize rotation; transparency makes unauthorized actions publicly detectable and attributable, but cannot undo valid cryptographic signatures.
+- A lost key has no recovery in V1. Email recovery is deliberately avoided because it would reduce security to the email provider.
+- A malicious operator can attempt split views; client pinning and $K$-of-$N$ witness quorums detect rollback and equivocation, while real-time decentralized gossip remains future work.
+- Bitcoin regtest anchoring provides auditable public evidence; independent OP_RETURNs do not provide Catena's single-history UTXO continuation property.
+- Current-state non-inclusion proofs (`StateMap`) are bound to checkpoints; full audit of sparse Merkle implementation is pending external cryptographic review.
+- This software is experimental and unaudited. It must not be used with real funds.
 
-Conceptual prior art: Zooko's Triangle, Certificate Transparency, CONIKS, Keybase, Catena and append-only authenticated data structures.
+### Zooko's Triangle: Separation of Namespace from Payment Identity
+
+SatsPath addresses practical aspects of Zooko's Triangle by separating **human-readable namespace authority** from **cryptographic payment identity**. SatsPath does not claim to solve the classical trilemma without external authority: human-readable identifiers (`alice@example.com` or `₿alice@example.com`) ultimately rely on DNS, DNSSEC, WebPKI, or platform domain registries. However, SatsPath reduces the trust placed in that infrastructure:
+1. The namespace authority can censor or stop publishing an identifier, but
+2. Once an identity binding has been independently authenticated or pinned, cryptographic verification and key continuity are designed to prevent a namespace provider from silently replacing the user's authenticated payment capabilities or identity keys without triggering a detectable verification failure.
+
+Conceptual prior art: Zooko's Triangle, Certificate Transparency (RFC 6962), CONIKS, Keybase, Catena, and append-only authenticated data structures.
