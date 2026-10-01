@@ -51,6 +51,13 @@ reviews:
     docstrings:
       threshold: 80
     custom_checks:
+      - name: "Non-Custodial Invariant & Key Separation"
+        mode: "error"
+        instructions: |
+          Verify that SatsPath NEVER handles, requests, stores, or generates private spending keys
+          (BIP-39 seeds, xprv/tprv, or node credentials). SatsPath holds only the non-custodial
+          secp256k1 identity keypair used for metadata profiles and rotations. The host wallet
+          must retain final authority for inspecting, signing, and executing payments.
       - name: "Daemon Authentication & Privilege Enforcement"
         mode: "error"
         instructions: |
@@ -96,37 +103,97 @@ reviews:
           Verify that profile updates enforce key continuity (TOFU) and monotonic sequence numbers,
           rejecting unauthorized key replacements. Verify that revoked profiles immediately halt
           resolution and routing without falling back to stale profiles.
+      - name: "Transparency Log & Witness Quorum Integrity"
+        mode: "error"
+        instructions: |
+          Verify append-only Merkle log compliance (RFC 6962), sparse Merkle state map (SMT)
+          non-inclusion proof validity, and K-of-N Schnorr witness quorum verification. Check that
+          equivocation, split-view, or rollback conditions trigger immediate local verification failures.
+      - name: "Multi-Source Fee Consensus Robustness"
+        mode: "error"
+        instructions: |
+          Verify concurrent multi-source fee queries (Bitcoin Core RPC, Esplora, Mempool.space)
+          properly calculate median filters, isolate failing or malicious sources, and safely
+          fall back to decaying caches without accepting anomalous single-source fee spikes.
+      - name: "Multi-Rail Wallet Handoff & Protocol Safety"
+        mode: "error"
+        instructions: |
+          Verify that wallet handoff payloads (BIP-21, BOLT11, BOLT12, Ark, Silent Payments)
+          strictly validate addresses, network prefixes (mainnet vs testnet/regtest), and amounts.
+          Ensure experimental rails fail closed if inputs or decoding are malformed.
 
   path_instructions:
-    - path: "crates/satspathd/**"
+    - path: "crates/satspath-core/**"
       instructions: |
-        Scrutinize satspathd for:
-        1. Any unauthenticated route that mutates internal state or leaks sensitive invite capabilities.
-        2. Content-Type and Host header validation to prevent CSRF and DNS rebinding.
-        3. Rate limiter IP spoofing and unbounded memory growth.
-        4. Proper error handling, avoiding unwraps and panics.
-    - path: "crates/satspath-swaps/**"
-      instructions: |
-        Scrutinize swap execution gates and transaction builders:
-        1. Must fail closed if transaction spending/broadcasting primitives are missing.
-        2. Ensure strict witness script verification for HTLCs.
-        3. Check for race conditions between refund timelocks and claim timeouts.
+        Audit core cryptographic primitives and state structures:
+        1. Schnorr signature verification (BIP-340) and canonical JSON serialization (RFC 8785).
+        2. Identity key rotation continuity (AuthorizationV1 and AcceptanceV1) and authorization checks.
+        3. Replay attack resistance, monotonic sequence numbering, and timestamp boundaries.
+        4. Append-only RFC 6962 Merkle log and Sparse Merkle state map (SMT) non-inclusion proofs.
     - path: "crates/satspath-core/src/resolvers/**"
       instructions: |
         Scrutinize all resolvers (HTTP, Nostr, BIP-353, Pear):
         1. SSRF prevention and IP connection pinning.
         2. Strict DNSSEC validation without blind trust in upstream AD bits.
         3. Immediate halt on revoked profiles; do not allow fallback to outdated profiles.
-    - path: "crates/satspath-core/src/**"
+        4. Nostr NIP-05 and kind 30078 event validation: verify SatsPath profile signature independently of relay signatures.
+    - path: "crates/satspath-router/**"
       instructions: |
-        Audit core cryptographic logic:
-        1. Schnorr signature verification (BIP-340) and canonical JSON serialization (RFC 8785).
-        2. Identity key rotation continuity and authorization checks.
-        3. Replay attack resistance, monotonic sequence numbering, and timestamp boundaries.
+        Scrutinize routing and fee logic:
+        1. Multi-source fee consensus: median filtering across Bitcoin Core, Esplora, and Mempool.space; decaying cache fallback.
+        2. BOLT12 TLV parsing, offer handling, and blinded-path primitives.
+        3. BIP-352 Silent Payments address/output derivation safety.
+        4. Ark payment pointer parsing and route scoring.
+        5. Wallet handoff payload formatting (BIP-21 URIs, BOLT11 invoices) with network prefix validation.
+    - path: "crates/satspath-cli/**"
+      instructions: |
+        Audit CLI client implementation:
+        1. Sensitive credential masking in logs, terminal outputs, and error displays.
+        2. Secure random generation for secp256k1 keys and memory zeroization.
+        3. Input sanitization for user-supplied identifiers, amounts, and URLs.
+    - path: "crates/satspathd/**"
+      instructions: |
+        Scrutinize satspathd daemon:
+        1. Any unauthenticated route that mutates internal state, performs identity binding, or leaks invite tokens (/v1/claim, /v1/invites).
+        2. Content-Type (application/json) and Host header validation to prevent CSRF and DNS rebinding.
+        3. Rate limiter IP spoofing and unbounded memory growth; enforce trusted proxy chain inspection or fallback to peer socket address.
+        4. Proper error handling, avoiding unwraps and panics.
+    - path: "crates/satspath-witness/**"
+      instructions: |
+        Scrutinize witness node:
+        1. K-of-N Schnorr checkpoint cosigning and consistency verification.
+        2. Local rollback, fork, and equivocation detection.
+        3. Strict refusal to cosign non-monotonic or conflicting state roots.
+    - path: "crates/satspath-swaps/**"
+      instructions: |
+        Scrutinize swap execution gates and transaction builders:
+        1. Must fail closed if transaction spending/broadcasting primitives are missing.
+        2. Ensure strict witness script verification for HTLCs (Taproot/SegWit).
+        3. Check for race conditions between refund timelocks and claim timeouts.
+        4. AES-256-GCM encrypted state storage and safe key handling.
+    - path: "crates/satspath-wasm/**"
+      instructions: |
+        Audit WebAssembly bindings:
+        1. Memory safety, pointer validation, and boundary serialization across JS/WASM.
+        2. Ensure panic-free operation and graceful error propagation.
+        3. Never expose raw spending keys or sensitive internal state to the host JS environment.
+    - path: "crates/satspath-pqc/**"
+      instructions: |
+        Audit post-quantum cryptography research module:
+        1. Hybrid classical + ML-DSA-65 signature schemes.
+        2. Constant-time operations and cryptographic boundary isolation.
+        3. Ensure research primitives are never used in production safety-critical claims.
+    - path: "sdk/satspath-p2p/**"
+      instructions: |
+        Audit Hyperswarm P2P profile transport:
+        1. DHT topic isolation and peer discovery validation.
+        2. Message size limits and rate limiting to prevent peer flooding or DoS.
+        3. Cryptographic signature verification of resolved profiles before acceptance.
     - path: "Dockerfile*"
       instructions: |
-        Audit container builds for outdated dependencies, known CVEs (especially OpenSSL/libssl),
-        unpinned package versions, and root execution risks.
+        Audit container builds:
+        1. Debian package version checks using dpkg-query for openssl and libssl3 (>= 3.0.22).
+        2. Unpinned package versions, root execution risks, and layer cache invalidation.
 
 chat:
   auto_reply: true
