@@ -66,6 +66,23 @@ identifier hash, key and profile hash in the latest event and its verifier key
 and method are explicitly trusted. Otherwise it remains false and first contact
 is TOFU.
 
+## Key continuity (CLI)
+
+A valid signature only proves that *some* key signed a profile. The CLI wraps the
+resolver chain in `PinnedResolver` (`satspath_core::key_pins`), which binds each
+identifier to the identity key already trusted for it:
+
+- first contact pins the key (TOFU) in `.satspath/known_keys.json`, keyed by
+  identifier hash;
+- the same key is accepted unless its `sequence` is lower than one already seen
+  (replay of an older copy);
+- a different key is accepted only with a `KeyRotation` authorized by the pinned
+  key; anything else fails with `UnauthorizedKeyReplacement`.
+
+A wallet that missed intermediate rotations fails closed; the user must verify
+the new key out of band and remove the pin. BIP-353 names have no identity key
+and are not pinned.
+
 ## Local Registry Resolver
 
 The local registry is a file-backed resolver used by CLI and daemon flows.

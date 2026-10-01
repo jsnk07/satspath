@@ -189,6 +189,7 @@ SatsPath is designed around a strict separation between **payment identity** and
 
 - Protocol identity keys are separate from Bitcoin wallet spending keys.
 - Public payment profiles are signed before they are used for routing.
+- CLI resolution binds each identifier to the identity key it already trusts (TOFU pin); a key change is accepted only with a rotation authorized by the pinned key.
 - Invalid, stale, ambiguous, or unsafe profile data should fail closed.
 - Resolver transports do not automatically become trust anchors.
 - Public resolver requests include SSRF and network-boundary protections.
