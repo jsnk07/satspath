@@ -69,7 +69,7 @@ This table is the source of truth for public claims about the current implementa
 | Signed payment profiles | **Implemented** | secp256k1 Schnorr signatures, canonical serialization, expiry and safety validation |
 | HTTPS resolver | **Active** | Resolves signed profiles over HTTPS with SSRF/network hardening |
 | Nostr resolver | **Active** | NIP-05 + kind 30078 resolution support |
-| BIP-353 / DNS | **Preview / experimental** | Resolver and DNS primitives exist; strict trust requires local DNSSEC validation |
+| BIP-353 / DNS | **Preview / experimental** | Strict mode uses local DNSSEC validation (fails closed); results are DNS payment instructions and are never presented as signed SatsPath identities |
 | Lightning Address / LNURL | **Implemented for discovery and handoff** | Can resolve public metadata and produce a wallet-facing payment payload |
 | BOLT11 | **Implemented for handoff paths** | Concrete invoices may be fetched through supported LNURL flows; SatsPath does not pay them |
 | BOLT12 | **Implemented for discovery and handoff** | Bech32m/TLV offer parsing, blinded path privacy routing, signed invoice requests, invoice validation, and gateway handoff |
