@@ -184,12 +184,12 @@ async fn test_wallet_executor_and_gate_policy_interaction() {
 }
 
 #[test]
-fn test_claim_refund_builders_available_for_supported_kinds() {
-    assert!(claim_refund_builders_available(SwapKind::Submarine));
-    assert!(claim_refund_builders_available(SwapKind::Reverse));
-    assert!(claim_refund_builders_available(SwapKind::Chain));
+fn test_claim_refund_builders_blocked_until_taproot_support() {
+    assert!(!claim_refund_builders_available(SwapKind::Submarine));
+    assert!(!claim_refund_builders_available(SwapKind::Reverse));
+    assert!(!claim_refund_builders_available(SwapKind::Chain));
 
-    assert!(ensure_claim_refund_builders_available(SwapKind::Submarine).is_ok());
-    assert!(ensure_claim_refund_builders_available(SwapKind::Reverse).is_ok());
-    assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_ok());
+    assert!(ensure_claim_refund_builders_available(SwapKind::Submarine).is_err());
+    assert!(ensure_claim_refund_builders_available(SwapKind::Reverse).is_err());
+    assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_err());
 }
