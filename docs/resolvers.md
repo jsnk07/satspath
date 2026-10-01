@@ -194,3 +194,12 @@ A SatsPath resolver implementation is conformant if it:
 - Distinguishes not found from invalid data.
 - Can be composed in a resolver chain.
 - Produces data compatible with the `QuoteResponse` pipeline.
+
+## Revocation
+
+A validly signed profile with `revoked = true` means the owner has disavowed that
+identity key, typically after a compromise. Every resolution path rejects it:
+the HTTP resolver and `ChainResolver` (for results from any transport) return
+`ProfileRevoked`, and the Nostr resolver rejects it as well. A revoked result
+stops the chain; it never falls through to a later resolver that might serve an
+older, non-revoked copy.

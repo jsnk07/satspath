@@ -59,7 +59,7 @@ The following feature branches have been merged directly into `main`:
 
 | Resolver | File | Status |
 | :--- | :--- | :--- |
-| `ChainResolver` (compositor with anti-substitution) | [`resolver.rs`](../crates/satspath-core/src/resolver.rs) | ✅ Complete |
+| `ChainResolver` (compositor with anti-substitution and revocation enforcement) | [`resolver.rs`](../crates/satspath-core/src/resolver.rs) | ✅ Complete |
 | `HttpResolver` (HTTPS `.well-known` + NIP-05) | [`http.rs`](../crates/satspath-core/src/resolvers/http.rs) | ✅ Complete (SSRF-hardened) |
 | `Bip353Resolver` (DNS TXT via DoH) | [`bip353.rs`](../crates/satspath-core/src/resolvers/bip353.rs) | ✅ Complete |
 | `NostrResolver` (NIP-05 author binding) | [`nostr.rs`](../crates/satspath-core/src/resolvers/nostr.rs) | ✅ Complete |
