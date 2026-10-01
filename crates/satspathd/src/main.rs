@@ -476,6 +476,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_rejects_cross_site_content_types_and_rebound_hosts() {
+        let config = rate_limit::RateLimiterConfig {
+            burst_capacity: 50,
+            refill_rate_per_sec: 50.0,
+            max_body_bytes: 65_536,
+            trust_proxy_headers: false,
+            cleanup_interval_secs: 300,
+        };
+        let (base_url, server, _handle) = start_test_daemon(config).await;
+        let client = reqwest::Client::new();
+        let body = r#"{"recipient":"carol@example.com","amount_sats":1000}"#;
+
+        // A text/plain POST is a CORS "simple request" a hostile page can send blind.
+        let res = client
+            .post(format!("{base_url}/v1/send"))
+            .header("Content-Type", "text/plain")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let res = client
+            .post(format!("{base_url}/v1/send"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+        // DNS rebinding: the connection lands on loopback but Host names the attacker.
+        let res = client
+            .get(format!("{base_url}/v1/profile"))
+            .header("Host", "attacker.example:9737")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+
+        for host in ["localhost:9737", "127.0.0.1", "[::1]:9737"] {
+            let res = client
+                .get(format!("{base_url}/health"))
+                .header("Host", host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::OK, "{host}");
+        }
+
+        server.unblock();
+    }
+
+    #[tokio::test]
+    async fn test_http_behind_proxy_accepts_public_host() {
+        let config = rate_limit::RateLimiterConfig {
+            burst_capacity: 50,
+            refill_rate_per_sec: 50.0,
+            max_body_bytes: 65_536,
+            trust_proxy_headers: true,
+            cleanup_interval_secs: 300,
+        };
+        let (base_url, server, _handle) = start_test_daemon(config).await;
+        let res = reqwest::Client::new()
+            .get(format!("{base_url}/health"))
+            .header("Host", "satspath.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        server.unblock();
+    }
+
+    #[tokio::test]
     async fn test_http_payload_too_large_rejection_413() {
         let config = rate_limit::RateLimiterConfig {
             burst_capacity: 10,

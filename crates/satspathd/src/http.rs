@@ -11,6 +11,12 @@ use crate::types::ErrorResponse;
 pub(crate) const MAX_JSON_BODY_BYTES: u64 = 65_536; // 64 KB limit to prevent DoS
 
 pub(crate) fn read_json<T: for<'de> serde::Deserialize<'de>>(request: &mut Request) -> Result<T> {
+    // Browsers send text/plain, form and multipart POSTs cross-origin without a CORS
+    // preflight. Requiring application/json forces a preflight, so a hostile page cannot
+    // drive mutations on a local daemon.
+    if !has_json_content_type(request) {
+        anyhow::bail!("unsupported media type: Content-Type must be application/json");
+    }
     let mut body = String::new();
     let mut reader = request.as_reader().take(MAX_JSON_BODY_BYTES + 1);
     reader.read_to_string(&mut body)?;
@@ -21,6 +27,40 @@ pub(crate) fn read_json<T: for<'de> serde::Deserialize<'de>>(request: &mut Reque
         anyhow::bail!("request body must be JSON");
     }
     Ok(serde_json::from_str(&body)?)
+}
+
+fn has_json_content_type(request: &Request) -> bool {
+    request.headers().iter().any(|h| {
+        h.field.equiv("Content-Type")
+            && h.value
+                .as_str()
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    })
+}
+
+/// Whether a request's Host header names a loopback host. A DNS-rebinding page arrives
+/// with its own domain in Host even though the connection lands on 127.0.0.1.
+pub(crate) fn is_loopback_host(request: &Request) -> bool {
+    let Some(host) = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().trim().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        host.rsplit_once(':')
+            .map_or(host.as_str(), |(name, _)| name)
+    };
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn json_result<T: Serialize>(
@@ -70,6 +110,8 @@ pub(crate) fn json_error(
 pub(crate) fn handle_read_error(e: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
     if e.to_string().contains("payload too large") {
         json_error(StatusCode(413), e)
+    } else if e.to_string().contains("unsupported media type") {
+        json_error(StatusCode(415), e)
     } else {
         json_error(StatusCode(400), e)
     }
