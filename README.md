@@ -135,7 +135,7 @@ This table reflects the actual status of the codebase (`crates/`) verified by un
 | **Authenticated State Map** | **IMPLEMENTED** | Sparse Merkle tree generating cryptographic non-inclusion proofs, bound to checkpoint root (`crates/satspath-core/src/state_map.rs`). |
 | **Witness Quorum Cosigning** | **IMPLEMENTED** | Standalone witness node (`crates/satspath-witness`) performing $K$-of-$N$ Schnorr cosigning, consistency verification, and local rollback/equivocation detection. |
 | **Ark Payment Routing** | **PREVIEW** | Receive pointer parsing and route scoring exist; live Ark ASP VTXO round execution is simulated (`crates/satspath-router/src/ark.rs`). |
-| **Submarine / Reverse Swaps** | **EXPERIMENTAL** | Boltz Exchange v2 client, AES-256-GCM encrypted store, and claim/refund tx builders for testnet/regtest only (`crates/satspath-swaps`). |
+| **Submarine / Reverse Swaps** | **EXPERIMENTAL** | Boltz Exchange v2 client, AES-256-GCM encrypted store, and a P2WSH claim/refund signer. Swap execution is blocked: Boltz v2 Taproot claim/refund and broadcast are not implemented, so the execution gate fails closed (`crates/satspath-swaps`). |
 | **Post-Quantum Cryptography** | **RESEARCH** | Hybrid signature module (`secp256k1` + ML-DSA-65) in `crates/satspath-pqc`. Research primitive; not part of production safety claim. |
 | **Mainnet Payment Execution** | **DELIBERATELY UNSUPPORTED** | SatsPath can discover and validate selected mainnet payment capabilities and hand compatible instructions to a wallet. Wallet-controlled software remains responsible for authorization, signing, and payment execution. |
 
