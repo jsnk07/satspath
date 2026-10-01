@@ -8,7 +8,8 @@
 use anyhow::Result;
 
 use satspath_core::bip321::{parse_bip321, Bip321Instruction};
-use satspath_core::bip353::{resolve_bip353_with, DnssecPolicy, DohTxtResolver};
+use satspath_core::bip353::{resolve_bip353_with, DnsTxtResolver, DnssecPolicy, DohTxtResolver};
+use satspath_core::resolvers::bip353::HickoryDnssecTxtResolver;
 
 pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Result<()> {
     let policy = if allow_insecure {
@@ -17,9 +18,15 @@ pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Re
         DnssecPolicy::Strict
     };
 
-    let resolver = DohTxtResolver::new();
+    // Strict mode needs a backend that validates DNSSEC locally; the DoH JSON
+    // backend cannot, so it is only used in the insecure dev mode.
+    let resolver: Box<dyn DnsTxtResolver + Send + Sync> = if allow_insecure {
+        Box::new(DohTxtResolver::new())
+    } else {
+        Box::new(HickoryDnssecTxtResolver::new())
+    };
     let now = chrono::Utc::now().timestamp();
-    let result = resolve_bip353_with(&resolver, name, policy, now).await;
+    let result = resolve_bip353_with(resolver.as_ref(), name, policy, now).await;
 
     if json {
         // JSON mode prints ONLY JSON — success or a structured error object.
@@ -81,9 +88,9 @@ pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Re
             if !allow_insecure {
                 println!();
                 println!("SatsPath fails closed in Strict mode: BIP-353 records must be");
-                println!("DNSSEC-validated. This build does not ship a local DNSSEC");
-                println!("validator, so Strict resolution is unavailable here. For local");
-                println!("testing only, re-run with --allow-insecure-dns-for-dev.");
+                println!("DNSSEC-validated locally, and this lookup could not be validated");
+                println!("(unsigned zone, broken chain of trust, or DNS unreachable). For");
+                println!("local testing only, re-run with --allow-insecure-dns-for-dev.");
             }
         }
     }
