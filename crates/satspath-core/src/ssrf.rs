@@ -206,6 +206,9 @@ pub struct ValidatedTarget {
     pub addrs: Vec<SocketAddr>,
 }
 
+/// Upper bound on resolving a URL's hostname in [`resolve_and_validate`].
+pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Validate `url` with [`validate_url`], resolve its host, and check every
 /// resolved address with [`check_resolved_addrs`].
 pub async fn resolve_and_validate(url: &str, allow_http: bool) -> Result<ValidatedTarget> {
@@ -221,9 +224,22 @@ pub async fn resolve_and_validate(url: &str, allow_http: bool) -> Result<Validat
         Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
         Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
         Some(url::Host::Domain(domain)) => {
-            let resolved = tokio::net::lookup_host((domain, port)).await.map_err(|e| {
-                SatsPathError::NetworkError(format!("DNS resolution failed for {domain}: {e}"))
-            })?;
+            // pinned_client's timeout only starts after resolution, so bound the lookup
+            // itself; otherwise a slow or hostile DNS server can stall the resolver.
+            let resolved =
+                tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((domain, port)))
+                    .await
+                    .map_err(|_| {
+                        SatsPathError::NetworkError(format!(
+                            "DNS resolution timed out for {domain} after {}s",
+                            DNS_LOOKUP_TIMEOUT.as_secs()
+                        ))
+                    })?
+                    .map_err(|e| {
+                        SatsPathError::NetworkError(format!(
+                            "DNS resolution failed for {domain}: {e}"
+                        ))
+                    })?;
             let ips = resolved.map(|sa| sa.ip()).collect();
             (domain.to_string(), ips)
         }
