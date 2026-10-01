@@ -17,7 +17,9 @@ use crate::{Result, SatsPathError, SignedPaymentProfile};
 /// 2. Verifies the profile signature (ECDSA secp256k1 over canonical JSON).
 /// 3. Checks the profile expiry (`expires_at` field).
 ///
-/// Both checks must pass. Fail-closed: unsigned or expired profiles are
+/// 4. Rejects profiles the owner has revoked (`revoked = true`).
+///
+/// All checks must pass. Fail-closed: unsigned, expired or revoked profiles are
 /// rejected with a hard error, never passed through.
 pub struct HttpResolver {
     client: Client,
@@ -136,6 +138,12 @@ impl HttpResolver {
 
         // SEC-01: enforce expiry — fail closed.
         check_profile_expiry(&signed.profile)?;
+
+        // SEC-03: a validly signed revocation is the owner disavowing this
+        // key (typically after a compromise). Never route payments to it.
+        if signed.profile.revoked {
+            return Err(SatsPathError::ProfileRevoked(signed.profile.alias.clone()));
+        }
 
         Ok(signed)
     }

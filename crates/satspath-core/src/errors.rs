@@ -14,6 +14,9 @@ pub enum SatsPathError {
     #[error("unauthorized identity key replacement")]
     UnauthorizedKeyReplacement,
 
+    #[error("profile revoked by its owner: {0}")]
+    ProfileRevoked(String),
+
     #[error("invalid key rotation: {0}")]
     InvalidRotation(String),
 

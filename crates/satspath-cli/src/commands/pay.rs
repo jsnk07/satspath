@@ -102,6 +102,11 @@ pub async fn cmd_pay(
     validate_compressed_pubkey(&signed.profile.identity_pubkey)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("  Signature valid.");
+    if signed.profile.revoked {
+        anyhow::bail!(
+            "Profile has been REVOKED by its owner. Do not pay this key. Aborting preview."
+        );
+    }
 
     println!("Selecting public payment route...");
     let req = RouteRequest {

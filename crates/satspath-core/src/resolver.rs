@@ -173,6 +173,13 @@ impl ProfileResolver for ChainResolver {
                             requested_canonical, returned_canonical
                         )));
                     }
+                    // SEC-03: revocation is enforced for every transport, not
+                    // only the ones that remember to check it. A revoked result
+                    // is a hard stop — never fall through to another resolver,
+                    // which could be serving an older, non-revoked copy.
+                    if profile.profile.revoked {
+                        return Err(SatsPathError::ProfileRevoked(returned_canonical));
+                    }
                     return Ok(profile);
                 }
                 Err(SatsPathError::AliasNotFound(_)) => continue,

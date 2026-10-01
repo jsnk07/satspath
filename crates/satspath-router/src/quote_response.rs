@@ -275,6 +275,11 @@ async fn route_verified_signed(
             reason: "Profile expired.".into(),
         };
     }
+    if signed.profile.revoked {
+        return QuoteResponse::NoRoute {
+            reason: "Profile revoked by its owner.".into(),
+        };
+    }
 
     // 4. Route.
     let req = RouteRequest {
