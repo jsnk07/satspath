@@ -82,7 +82,11 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         || path == "/v1/transparency/verify/inclusion"
         || path == "/v2/resolve";
 
-    if is_mutation && !is_public_mutation {
+    // Invite records and claim notifications expose invite IDs (the claim capability),
+    // amounts and recipient hints, so they are owner-only even though they are reads.
+    let is_private_read = path == "/v1/invites" || path.starts_with("/v1/invites/");
+
+    if (is_mutation && !is_public_mutation) || is_private_read {
         if let Err(e) = check_auth(&request, &state.auth_token) {
             let _ = request.respond(json_error(StatusCode(401), e));
             return Ok(());
@@ -368,6 +372,20 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
         (Method::Post, "/v1/claim") => {
             let _guard = state.mutation_lock.lock().await;
             match read_json::<ClaimRequest>(&mut request) {
+                // A claim without a receiver-signed profile rewrites the daemon's own
+                // identity and payment methods, so only the authenticated owner may do it.
+                Ok(body)
+                    if body.signed_profile.is_none()
+                        && check_auth(&request, &state.auth_token).is_err() =>
+                {
+                    json_error(
+                        StatusCode(401),
+                        anyhow::anyhow!(
+                            "Unauthorized: claiming with the daemon identity requires the \
+                             admin Bearer token; public claims must include a signed_profile"
+                        ),
+                    )
+                }
                 Ok(body) => match claim_invite_handler(state, body) {
                     Ok(resp) => json_response(StatusCode(200), &resp),
                     Err(e) => {

@@ -476,6 +476,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_claim_and_invite_listing_require_auth() {
+        let config = rate_limit::RateLimiterConfig {
+            burst_capacity: 50,
+            refill_rate_per_sec: 50.0,
+            max_body_bytes: 65_536,
+            trust_proxy_headers: false,
+            cleanup_interval_secs: 300,
+        };
+        let (base_url, server, _handle) = start_test_daemon(config).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated claim using the daemon identity must not reach the handler.
+        let res = client
+            .post(format!("{base_url}/v1/claim"))
+            .json(&serde_json::json!({
+                "invite_id": "any",
+                "alias": "victim@example.com",
+                "lightning_address": "attacker@evil.example"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // With the owner token it reaches the handler (unknown invite -> 404).
+        let res = client
+            .post(format!("{base_url}/v1/claim"))
+            .bearer_auth("test_token")
+            .json(&serde_json::json!({
+                "invite_id": "missing",
+                "alias": "victim@example.com",
+                "lightning_address": "owner@example.com"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+
+        for path in ["/v1/invites", "/v1/invites/notifications"] {
+            let res = client
+                .get(format!("{base_url}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+
+            let res = client
+                .get(format!("{base_url}{path}"))
+                .bearer_auth("test_token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::OK, "{path}");
+        }
+
+        server.unblock();
+    }
+
+    #[tokio::test]
     async fn test_http_payload_too_large_rejection_413() {
         let config = rate_limit::RateLimiterConfig {
             burst_capacity: 10,
