@@ -59,6 +59,10 @@ pub async fn create_chain_swap(
     store: &SwapStore,
     params: ChainSwapParams,
 ) -> Result<ChainSwapCreated> {
+    // Fail closed before contacting Boltz: without a working claim/refund path a
+    // created swap could strand the funds sent to it.
+    crate::execution_gate::ensure_claim_refund_builders_available(SwapKind::Chain)?;
+
     // Validate limits
     let limits = client.get_limits().await?;
     if params.send_amount_sats < limits.minimal {

@@ -50,6 +50,10 @@ pub async fn create_reverse(
     store: &SwapStore,
     params: ReverseParams,
 ) -> Result<ReverseSwapCreated> {
+    // Fail closed before contacting Boltz: without a working claim/refund path a
+    // created swap could strand the funds sent to it.
+    crate::execution_gate::ensure_claim_refund_builders_available(SwapKind::Reverse)?;
+
     // Validate limits
     let limits = client.get_limits().await?;
     if params.receive_amount_sats < limits.minimal {
@@ -161,6 +165,10 @@ pub async fn wait_and_claim_reverse(
             })
         }
         SwapStatus::TransactionConfirmed => {
+            // Persist the confirmed lockup before attempting the claim, so a failed
+            // claim still leaves the swap visible to recovery.
+            store.update_status(swap_id, SwapStatus::TransactionConfirmed, None)?;
+
             // Retrieve persisted record to get preimage and claim key
             let record = store
                 .get(swap_id)?

@@ -193,3 +193,91 @@ fn test_claim_refund_builders_blocked_until_taproot_support() {
     assert!(ensure_claim_refund_builders_available(SwapKind::Reverse).is_err());
     assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_err());
 }
+
+#[tokio::test]
+async fn swap_creation_fails_closed_before_contacting_boltz() {
+    use satspath_swaps::boltz_client::BoltzClient;
+    use satspath_swaps::chain_swap::{create_chain_swap, ChainSwapParams};
+    use satspath_swaps::reverse::{create_reverse, ReverseParams};
+    use satspath_swaps::submarine::{create_submarine, SubmarineParams};
+    use satspath_swaps::SwapStore;
+
+    // Nothing listens here: reaching the network would surface a connection error
+    // instead of the execution-gate error asserted below.
+    let client = BoltzClient::new("http://127.0.0.1:9/v2", "ws://127.0.0.1:9/v2/ws");
+    let dir = std::env::temp_dir().join(format!("satspath-gate-{}", std::process::id()));
+    let store = SwapStore::open_plaintext_for_tests(dir.join("swaps.json"));
+    let dest = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string();
+
+    let errs = [
+        create_submarine(
+            &client,
+            &store,
+            SubmarineParams {
+                invoice: "lntb1mock".into(),
+                amount_sats: 50_000,
+            },
+        )
+        .await
+        .err()
+        .map(|e| e.to_string()),
+        create_reverse(
+            &client,
+            &store,
+            ReverseParams {
+                receive_amount_sats: 50_000,
+                destination_address: dest.clone(),
+            },
+        )
+        .await
+        .err()
+        .map(|e| e.to_string()),
+        create_chain_swap(
+            &client,
+            &store,
+            ChainSwapParams {
+                send_amount_sats: 50_000,
+                destination_address: dest,
+                sender_pays_fees: false,
+            },
+        )
+        .await
+        .err()
+        .map(|e| e.to_string()),
+    ];
+    for err in errs {
+        let err = err.expect("swap creation must be refused");
+        assert!(err.contains("execution blocked"), "unexpected error: {err}");
+    }
+    assert!(store.list_all().unwrap().is_empty());
+}
+
+#[test]
+fn confirmed_reverse_swap_is_recoverable() {
+    let mut record = SwapRecord {
+        id: "rev-confirmed".into(),
+        kind: SwapKind::Reverse,
+        status: SwapStatus::TransactionConfirmed,
+        created_at: Utc::now().timestamp(),
+        updated_at: Utc::now().timestamp(),
+        amount_sats: 50_000,
+        preimage_hex: None,
+        preimage_hash_hex: None,
+        lockup_address: None,
+        claim_key_hex: None,
+        refund_key_hex: None,
+        invoice: None,
+        expected_amount_sats: None,
+        timeout_block_height: None,
+        boltz_claim_pubkey: None,
+        redeem_script: None,
+        lockup_txid: None,
+        settlement_txid: None,
+        destination_address: None,
+    };
+    assert!(record.is_recoverable());
+
+    // A confirmed submarine lockup is Boltz's to claim, not ours to recover.
+    record.kind = SwapKind::Submarine;
+    assert!(!record.is_recoverable());
+}

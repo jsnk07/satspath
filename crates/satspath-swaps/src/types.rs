@@ -199,7 +199,7 @@ impl SwapRecord {
         matches!(
             self.status,
             SwapStatus::InvoiceFailedToPay | SwapStatus::TransactionLockupFailed
-        )
+        ) || (self.kind == SwapKind::Reverse && self.status == SwapStatus::TransactionConfirmed)
     }
 }
 

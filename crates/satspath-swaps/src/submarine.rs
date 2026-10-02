@@ -41,6 +41,10 @@ pub async fn create_submarine(
     store: &SwapStore,
     params: SubmarineParams,
 ) -> Result<SubmarineSwapCreated> {
+    // Fail closed before contacting Boltz: without a working claim/refund path a
+    // created swap could strand the funds sent to it.
+    crate::execution_gate::ensure_claim_refund_builders_available(SwapKind::Submarine)?;
+
     // Validate against Boltz limits
     let limits = client.get_limits().await?;
     if params.amount_sats < limits.minimal {
