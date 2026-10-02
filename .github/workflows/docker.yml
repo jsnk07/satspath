@@ -12,6 +12,13 @@ on:
       - "crates/**"
   pull_request:
     branches: [main, develop, satspath-standalone]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".dockerignore"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
   workflow_dispatch:
 
 env:
