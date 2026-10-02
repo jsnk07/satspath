@@ -602,7 +602,7 @@ pub fn cmd_wallet_publish(alias: Option<&str>) -> Result<()> {
     println!();
     println!("Publish it peer-to-peer with the Holepunch SDK:");
     println!("  cd sdk/satspath-p2p && npm install");
-    println!("  node examples/publish.mjs {}", out_path.display());
+    println!("  node examples/publish.mjs {alias} {}", out_path.display());
     println!();
     println!("Another device can then resolve it:");
     println!("  node examples/resolve.mjs {alias}");
