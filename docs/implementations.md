@@ -1,17 +1,21 @@
 # SatsPath Implementations
 
-This document maps the SatsPath Protocol v1 specification to the current repository implementation.
+This document maps the SatsPath Protocol specification to the current repository implementation.
 
 The implementation must be understood as a protocol stack, not as a single P2P system. P2P is one transport implementation among several.
 
 ## Repository Layout
 
 ```txt
-crates/satspath-core      protocol data types, signatures, resolvers, validation
-crates/satspath-router    quote response contract and route selection
+crates/satspath-core      protocol data types, signatures, resolvers, validation, transparency log, state map
+crates/satspath-router    quote response contract, fee consensus, BOLT12, Silent Payments, route selection
 crates/satspath-cli       command-line reference client
-crates/satspathd          local daemon and HTTP API
-docs/                     protocol and operational documentation
+crates/satspathd          local / authoritative daemon and HTTP API
+crates/satspath-witness   independent witness node and K-of-N checkpoint cosigner
+crates/satspath-wasm      WebAssembly bindings for browser / wallet integrations
+crates/satspath-swaps     experimental testnet/regtest swap scaffolding (Boltz v2)
+crates/satspath-pqc       experimental post-quantum hybrid signature research module (ML-DSA-65)
+docs/                     protocol, security, and operational documentation
 ```
 
 ## Core Protocol Types
@@ -44,9 +48,9 @@ crates/satspath-core/src/validation.rs
 
 Responsibilities:
 
-- Generate protocol identity keypairs.
-- Sign public profiles.
-- Verify signed profiles.
+- Generate protocol identity keypairs (`secp256k1`).
+- Sign public profiles with BIP-340 Schnorr signatures.
+- Verify signed profiles over canonical JSON (RFC 8785).
 - Compute identity fingerprints.
 - Reject malformed public keys.
 - Reject private material in public protocol objects.
@@ -69,10 +73,10 @@ Current resolver surfaces:
 
 | Resolver            | File                               | Status                                                                    |
 | ------------------- | ---------------------------------- | ------------------------------------------------------------------------- |
-| Local registry      | `registry.rs`                      | Active                                                                    |
-| Local peer registry | `peer_registry.rs`                 | Active local storage                                                      |
+| Local registry      | `registry.rs`                      | Active local storage                                                      |
+| Local peer registry | `peer_registry.rs`                 | Active local peer storage                                                 |
 | BIP-353             | `resolvers/bip353.rs`, `bip353.rs` | Resolver and DNS primitives; strict DNSSEC fails closed without validator |
-| HTTPS               | `resolvers/http.rs`                | Active                                                                    |
+| HTTPS               | `resolvers/http.rs`                | Active HTTPS `.well-known` resolver with URL validation                   |
 | Nostr               | `resolvers/nostr.rs`               | Active NIP-05 + kind 30078 resolver                                       |
 | Platform            | `resolvers/platform.rs`            | Scaffold                                                                  |
 
@@ -87,6 +91,8 @@ crates/satspath-router/src/quote_response.rs
 crates/satspath-router/src/router.rs
 crates/satspath-router/src/fees.rs
 crates/satspath-router/src/lightning.rs
+crates/satspath-router/src/bolt12.rs
+crates/satspath-router/src/silent_payments.rs
 ```
 
 Spec mapping:
@@ -98,7 +104,7 @@ Spec mapping:
 | Check expiry          | `check_profile_expiry`                   |
 | Select route          | `select_route`, `select_route_with_fees` |
 | Build payment payload | `build_qr_payload`                       |
-| Stable response       | `QuoteResponse`                          |
+| Standard response contract | `QuoteResponse`                          |
 
 `QuoteResponse` status values:
 
@@ -119,7 +125,7 @@ Implemented in:
 crates/satspathd/src/main.rs
 ```
 
-The daemon exposes the protocol over a local HTTP API:
+The daemon exposes the protocol over a local/reverse-proxied HTTP API:
 
 | Endpoint                   | Purpose                                       |
 | -------------------------- | --------------------------------------------- |
@@ -146,14 +152,23 @@ crates/satspath-cli/src/
 
 Important commands:
 
-| Command area         | Protocol role                        |
-| -------------------- | ------------------------------------ |
-| `register`           | Create signed public profile         |
-| `wallet`             | Manage local receive profile         |
-| `quote`              | Produce quote response               |
-| `pay`                | Preview/handoff flow                 |
-| `dns`                | BIP-353 resolver tooling             |
-| `peer export/import` | Manual transport for signed profiles |
+| Command | Protocol role |
+| :--- | :--- |
+| `register <alias>` | Create signed public profile |
+| `show <alias>` | Display profile and optionally verify domain proofs online (`--verify-online`) |
+| `wallet <subcommand>` | Manage local identity key and receive profile (`init`, `rotate`, `add-methods`, `show`, `publish`) |
+| `quote <alias> <amount>` | Produce quote response with multi-source fee evaluation |
+| `preview <recipient> <amount>` | Build mainnet-compatible public payment preview (`--mainnet`, `--json`) |
+| `pay <alias> <amount>` | Resolve, route, and build QR preview |
+| `dns resolve <name>` | BIP-353 resolver tooling (`--allow-insecure-dns-for-dev`) |
+| `export <alias>` | Export signed profile as JSON to stdout |
+| `import [file] [--url <url>]` | Import and cryptographically verify signed profile from file, stdin, or URL |
+| `prove` / `attach-proof` | Generate challenge and attach method ownership proofs |
+| `encode` / `decode` | Universal SatsPath URI encoding and decoding |
+| `invite` / `claim` | Invitation generation and claim flows |
+| `server` | Sovereign server and DNS operator onboarding (`init`, `check`) |
+| `web` | Minimal local receive web UI on localhost |
+| `demo` | Run full local protocol demonstration flow |
 
 The CLI is a reference client for local development and protocol testing.
 
@@ -178,14 +193,16 @@ Wire behavior is documented in [wire_p2p.md](./wire_p2p.md).
 
 ## Current Gaps
 
-Known v1 implementation gaps:
+Known v1/v2 implementation gaps:
 
-- DNSSEC strict mode needs a local DNSSEC-validating resolver to fully trust BIP-353 on mainnet.
-- Nostr publishing is not yet exposed as a Rust CLI command; use a Nostr client to publish the kind 30078 event. Platform resolvers are scaffolds.
-- Resolver provenance is not yet carried through `ProfileResolver`, so signed-profile quote responses mark `identifier_verified: false` unless a direct BIP-353 preview provides DNSSEC validation.
-- Mainnet payment execution is intentionally not implemented.
-- P2P wire envelopes should be formalized in the SDK to match [wire_p2p.md](./wire_p2p.md).
-- Method ownership proofs exist in core but need broader resolver integration.
+- **DNSSEC Local Validation:** BIP-353 strict mode requires an embedded validating resolver to avoid relying on upstream resolver flags or failing closed.
+- **BOLT12 Interoperability:** Prototype TLV, offer-handling, and blinded-path primitives exist, but standards-conformant checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and interoperability with implementations such as Core Lightning and LDK remain incomplete.
+- **Silent Payments Interoperability:** Experimental Silent Payments primitives and address/output construction are implemented; BIP-352 conformance and interoperability remain unverified until the official send/receive test vectors pass.
+- **External Security Audit:** Independent third-party cryptographic and security audit is required before recommending real-funds production usage.
+- **Ark Settlement:** Ark remains preview / simulated (receive pointers and routing exist; live ASP round execution is mocked).
+- **Mainnet Payment Execution:** Mainnet payment execution and transaction signing are deliberately unsupported (delegated to host wallets).
+- **Cross-Witness Gossip:** Cross-witness public gossip protocol for real-time split-view alerting is designed but not yet deployed.
+- **Method Ownership Proofs:** Method ownership proofs exist in core and are enforced for quotes, with wider resolver adoption ongoing.
 
 ## Conformance Checklist
 

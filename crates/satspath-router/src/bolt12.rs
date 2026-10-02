@@ -1,3 +1,9 @@
+//! BOLT12 — EXPERIMENTAL / PARTIAL.
+//!
+//! Prototype TLV, offer-handling, and blinded-path primitives exist, but standards-conformant
+//! checksumless BOLT12 string decoding, invoice-request construction, Merkle signing, and
+//! interoperability with implementations such as Core Lightning and LDK remain incomplete.
+
 use std::io::{Cursor, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,7 +257,7 @@ impl BlindedPath {
 /// Spec: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bolt12Offer {
-    /// The offer string (bech32m encoded starting with "lno1..." or "lnot1...")
+    /// The offer string (prototype bech32-encoded string starting with "lno1..." or "lnot1...")
     pub offer: String,
     /// Human-readable description
     pub description: Option<String>,
@@ -478,7 +484,7 @@ impl Bolt12InvoiceRequest {
             "lnr"
         };
         let encoded = bech32::encode(hrp, raw.to_base32(), bech32::Variant::Bech32m)
-            .map_err(|e| anyhow!("bech32m invoice request encoding failed: {e}"))?;
+            .map_err(|e| anyhow!("invoice request encoding failed: {e}"))?;
         Ok(encoded)
     }
 }
@@ -490,7 +496,7 @@ impl Bolt12InvoiceRequest {
 /// BOLT12 Invoice - returned by the offer creator in response to an invoice request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bolt12Invoice {
-    /// The invoice string (bech32m encoded starting with "lni1..." or "lnit1...")
+    /// The invoice string (prototype bech32-encoded string starting with "lni1..." or "lnit1...")
     pub invoice: String,
     /// Human-readable description
     pub description: Option<String>,
@@ -594,7 +600,7 @@ impl Bolt12Invoice {
             "lni"
         };
         let encoded = bech32::encode(hrp, raw.to_base32(), bech32::Variant::Bech32m)
-            .map_err(|e| anyhow!("bech32m invoice encoding failed: {e}"))?;
+            .map_err(|e| anyhow!("invoice encoding failed: {e}"))?;
         Ok(encoded)
     }
 }
@@ -603,7 +609,7 @@ impl Bolt12Invoice {
 // Parsing Functions
 // ============================================================================
 
-/// Parse a BOLT12 offer string (bech32m format).
+/// Parse a prototype BOLT12 offer string (experimental TLV / bech32 format; not standards-conformant checksumless BOLT12 string decoding).
 pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
     let trimmed = offer.trim();
     if !trimmed.starts_with("lno1")
@@ -770,7 +776,7 @@ pub fn parse_bolt12_offer(offer: &str) -> Result<Bolt12Offer> {
     })
 }
 
-/// Parse a BOLT12 invoice request string.
+/// Prototype parser for a BOLT12 invoice request string (experimental).
 pub fn parse_bolt12_invoice_request(request: &str) -> Result<Bolt12InvoiceRequest> {
     let trimmed = request.trim();
     if !trimmed.starts_with("lnr1") && !trimmed.starts_with("lnrt1") {
@@ -884,7 +890,7 @@ pub fn parse_bolt12_invoice_request(request: &str) -> Result<Bolt12InvoiceReques
     })
 }
 
-/// Parse a BOLT12 invoice string.
+/// Prototype parser for a BOLT12 invoice string (experimental).
 pub fn parse_bolt12_invoice(invoice: &str) -> Result<Bolt12Invoice> {
     let trimmed = invoice.trim();
     if !trimmed.starts_with("lni1")
@@ -1086,7 +1092,7 @@ pub fn create_signed_invoice_request(
     Ok(req)
 }
 
-/// Encode a BOLT12 invoice request to bech32m string.
+/// Prototype helper to encode a BOLT12 invoice request to a bech32 string (experimental).
 pub fn encode_invoice_request(request: &Bolt12InvoiceRequest) -> Result<String> {
     request.encode()
 }

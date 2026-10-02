@@ -61,7 +61,7 @@ fn test_attack_ssrf_cloud_metadata() {
     );
 
     println!(
-        "🛡️ DEFENSE SUCCESS: Network firewall explicitly blocked all internal/loopback fetches."
+        "🛡️ DEFENSE SUCCESS: URL validation rejected all tested literal loopback/private/internal destinations."
     );
 }
 
