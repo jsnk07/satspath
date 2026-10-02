@@ -1,133 +1,106 @@
 # SatsPath Architecture
 
-The key-transparency extension is specified in [Key Transparency Architecture](key_transparency.md). Resolution is not fully verified solely because a profile self-signature validates.
+SatsPath is an open-source payment discovery and routing layer for the Bitcoin ecosystem. It resolves human-readable identifiers to cryptographically authenticated payment capabilities across multiple compatible payment rails, while delegating transaction signing and execution to sovereign user wallets.
 
-## Overview
+---
 
-SatsPath is a routing and resolution layer that sits above existing Bitcoin payment protocols.
-It does not replace Lightning, Ark, or on-chain payments — it resolves human-readable
-identifiers to signed payment profiles and selects the best available rail.
+## 1. Core Architecture & Pipeline
 
-## System Diagram
+```mermaid
+flowchart TD
+    A[Human-Readable Identifier\nalice@example.com] --> B[Resolution & Discovery\nHTTPS / Nostr / BIP-353 / S2S]
+    B --> C[Cryptographic Verification\nSchnorr Signature + Merkle Inclusion + Checkpoint]
+    C --> D[Payment Capability Discovery\nLightning / BOLT12 / On-chain / Silent Payments / Ark]
+    D --> E[Routing & Rail Selection\nAmount + Multi-Source Fees + Urgency]
+    E --> F[Wallet Handoff Payload\nBIP-21 URI / BOLT11 / BOLT12 / Ark Pointer / QR]
+    F --> G[Host Wallet Execution\nUser signs with spending key & broadcasts]
 
-```
-Human-readable identifier
-  (e.g. rodrigo@satspath.dev)
-          |
-          v
-  ┌───────────────────┐
-  │  Resolver /       │
-  │  Transparent      │  <── transactional SQLite event/profile/checkpoint state
-  │  Resolver         │  <── pinned log_id + checkpoint/operator continuity
-  │                   │  <── BIP-353 / HTTPS / Nostr / optional P2P
-  └────────┬──────────┘
-           |
-           v
-  ┌───────────────────┐
-  │  Signed Payment   │
-  │  Profile          │
-  │                   │
-  │  - alias          │
-  │  - identity_pubkey│
-  │  - methods[]      │
-  │  - signature      │
-  └────────┬──────────┘
-           |
-           v
-  ┌───────────────────┐
-  │ Merkle + history  │
-  │ + ownership gate  │
-  └────────┬──────────┘
-           v
-  ┌───────────────────┐
-  │  Route Engine     │
-  └──────┬────┬───────┘
-         |    |    \
-         v    v     v
-    ┌────┐ ┌──────┐ ┌─────┐
-    │ LN │ │ BTC  │ │ Ark │
-    └────┘ └──────┘ └─────┘
-       |       |        |
-       v       v        v
-  Invoice   PSBT    Ark Intent
+    classDef highlight fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef sats fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    classDef wallet fill:#cfe2ff,stroke:#0d6efd,stroke-width:2px;
+    class A,B,C,D,E,F sats;
+    class G wallet;
 ```
 
-## Crate Structure
+### The Core Architectural Principle: Non-Custodial Separation
 
-```
+**SatsPath does not need, and never requests, the user's private spending keys.**
+
+This is not a missing feature—it is an intentional **security property**:
+* **No custody of funds:** SatsPath does not custody, seize, or freeze user funds.
+* **No seed phrases or private keys:** SatsPath never manages BIP-39 seeds, xprv/tprv keys, or node credentials.
+* **Not a wallet:** SatsPath discovers and validates payment capabilities; host wallets retain 100% control over fund authorization, coin selection, transaction signing, and network broadcast.
+* **Custody Risk vs. Payment Redirection Risk:** Compromising SatsPath does not directly expose wallet spending keys or authorize Bitcoin transactions. However, a compromised discovery or handoff component may attempt payment redirection, which is why authenticated profiles, key continuity, resolver verification, and wallet-side confirmation of destination details remain security-critical.
+
+---
+
+## 2. Workspace Crate Architecture
+
+The SatsPath codebase is organized as a modular Rust workspace:
+
+```text
 satspath/
 ├── crates/
-│   ├── satspath-core/          # Types, crypto, codec, registry
-│   │   ├── profile.rs          # PaymentProfile, PaymentMethod, SignedPaymentProfile
-│   │   ├── crypto.rs           # secp256k1 keypair, sign, verify, fingerprint
-│   │   ├── codec.rs            # encode/decode satspath: URIs
-│   │   ├── registry.rs         # local file registry
-│   │   └── errors.rs           # SatsPathError enum
-│   │
-│   ├── satspath-router/        # Route selection engine
-│   │   ├── router.rs           # select_route() — priority logic
-│   │   ├── fees.rs             # mempool.space fee API client
-│   │   ├── lightning.rs        # Lightning availability + fee helpers
-│   │   ├── onchain.rs          # On-chain fee math + availability
-│   │   └── ark.rs              # ArkClient trait + MockArkClient
-│   │
-│   └── satspath-cli/           # User-facing binary
-│       └── commands/           # One module per CLI subcommand
+│   ├── satspath-core/          # Protocol models, secp256k1 crypto, canonical serialization,
+│   │                           # Merkle tree transparency, state map, and resolvers (HTTP, Nostr, BIP-353)
+│   ├── satspath-router/        # Payment capability discovery, multi-source fee consensus,
+│   │                           # BOLT12 handling, BIP-352 Silent Payments, routing heuristics, and handoff
+│   ├── satspath-cli/           # Reference command-line client for development and preview flows
+│   ├── satspathd/              # Authoritative server daemon, REST API, transparency endpoint, rate limiting
+│   ├── satspath-witness/       # Independent witness node daemon, K-of-N checkpoint cosigning,
+│   │                           # rollback and split-view detection
+│   ├── satspath-wasm/          # WebAssembly bindings for browser and web wallet integrations
+│   ├── satspath-swaps/         # Experimental testnet/regtest swap scaffolding (submarine/reverse)
+│   └── satspath-pqc/           # Experimental post-quantum hybrid signature research module (ML-DSA-65)
+├── packages/                   # TypeScript packages and verification libraries
+└── proxy-workers/              # Stateless edge helper workers (e.g. Cloudflare)
 ```
 
-## Data Flow
+### Crate Responsibilities & Maturity
 
-### Payment request lifecycle
+| Crate | Maturity Status | Role & Safety Boundary |
+| :--- | :--- | :--- |
+| **`satspath-core`** | **IMPLEMENTED** | Core protocol primitives: profile schemas, canonical RFC 8785 JSON, `secp256k1` Schnorr signatures, append-only Merkle log, Sparse Merkle state map, and resolver chain. |
+| **`satspath-router`** | **IMPLEMENTED** | Evaluates payment methods, aggregates multi-source fee estimates, formats wallet handoffs, and contains experimental BOLT12 and BIP-352 handling primitives subject to the capability-specific maturity limits documented in README.md. |
+| **`satspath-cli`** | **IMPLEMENTED** | Developer tool for local profile generation, proof verification, route simulation, and QR generation. Does not execute mainnet payments. |
+| **`satspathd`** | **IMPLEMENTED** | Server-to-server daemon exposing authenticated profile endpoints, transparency logs, signed checkpoints, and rate-limiting defenses. |
+| **`satspath-witness`**| **IMPLEMENTED** | Lightweight monitor node that tracks daemon checkpoints, independently verifies consistency proofs, cosigns checkpoints via Schnorr signatures, and detects split views. |
+| **`satspath-wasm`** | **PREVIEW** | Compiles core resolution and routing logic to WebAssembly for client-side execution in web apps and sovereign wallets. |
+| **`satspath-swaps`** | **EXPERIMENTAL**| Testnet/regtest scaffolding for Boltz v2 swaps. Encrypted local store (AES-256-GCM) and claim/refund tx builders for testnet only. |
+| **`satspath-pqc`** | **RESEARCH** | Research prototype testing hybrid classical + post-quantum signatures (`secp256k1` + ML-DSA-65). Not part of the production safety claim. |
 
+---
+
+## 3. Data Flow & Security Boundaries
+
+```mermaid
+flowchart LR
+    subgraph Client ["Client Device (Local / Wallet)"]
+        A[User Input] --> B[SatsPath Client / WASM]
+        B --> C[Local Verifier]
+        C --> D[Wallet Signer]
+    end
+
+    subgraph Network ["Untrusted Network Layer"]
+        E[DNS / HTTPS / Nostr]
+        F[Witness Quorum]
+    end
+
+    subgraph Server ["Authoritative Infrastructure"]
+        G[S2S Daemon / Log]
+    end
+
+    B -->|Query| E
+    E -->|Profile + Proofs| C
+    G -->|Signed Checkpoints| F
+    F -->|Cosignatures| C
+    D -->|Execute Payment| H[Bitcoin / Lightning Network]
 ```
-1. Sender knows: rodrigo@satspath.dev + 21000 sats
 
-2. Encode (optional):
-   satspath:v1:<base64url({"version":1,"alias":"rodrigo@satspath.dev","amount_sats":21000,...})>
+### Trust Boundaries
 
-3. Decode:
-   PaymentRequest { alias, amount_sats, memo, ... }
-
-4. Resolve and verify:
-   profile -> signed event -> checkpoint-bound inclusion -> pinned consistency
-   -> operator continuity -> ownership-verified method allow-list
-
-6. Route:
-   select_route(RouteRequest { alias, amount_sats, signed_profile })
-   -> RouteQuote { selected_method, reason, fee, confirmation }
-
-7. Pay (simulated):
-   Execute against selected rail (Lightning invoice, on-chain tx, Ark intent)
-```
-
-### Invite lifecycle (unregistered receiver)
-
-```
-1. Sender tries to pay julian@example.com
-2. Registry returns AliasNotFound
-3. create_invite("julian@example.com", amount_sats) -> Invite
-4. Invite contains alias_hash, claim_url, warning
-5. Sender shares claim_url with receiver out-of-band
-6. Receiver generates their own keys locally and registers
-7. Sender retries payment
-```
-
-## Security Boundaries
-
-- Private keys never leave the user's machine.
-- The registry stores only public data (pubkeys, addresses, signatures).
-- Profile, history, checkpoint binding, pin/operator continuity and selected
-  method ownership verification happen before any quote/pay route.
-- The `.satspath/` directory is git-ignored.
-
-## Pluggability
-
-The registry is an abstraction — in production, `Registry::open()` can be swapped for:
-
-- BIP-353 DNS TXT record lookup
-- Nostr NIP-05 / NIP-57 resolution
-- Lightning Address `.well-known/lnurlp` discovery
-- A decentralized DHT
-
-The router is similarly pluggable: new payment rails are added by implementing
-the routing priority logic and returning a `RouteQuote`.
+1. **User Identity Keypair:** Generated locally on the user's device. Used exclusively to authorize public profile updates and key rotations. Never transmitted over the network.
+2. **Resolver Transports:** HTTPS, Nostr, DNS, and local files are treated as untrusted transports. All returned profiles must be independently verified by the local client.
+3. **Log Operator:** The log operator signs checkpoints committing to append-only history. It cannot author identity changes or key rotations without the user's private key signature.
+4. **Witness Quorum:** Independent witnesses cosign operator checkpoints only after verifying append-only consistency proofs. Quorum threshold ($K$-of-$N$) ensures single-witness compromise cannot validate a split view.
+5. **Host Wallet:** The host wallet remains the sovereign arbiter of funds. SatsPath provides the validated payment instructions; the wallet checks amounts, prompts the user, signs, and broadcasts.

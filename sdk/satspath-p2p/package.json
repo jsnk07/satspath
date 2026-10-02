@@ -1,0 +1,10 @@
+{
+  "name": "satspath-p2p",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental public SignedPaymentProfile transport",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test" },
+  "dependencies": { "hyperswarm": "^4.0.0" }
+}

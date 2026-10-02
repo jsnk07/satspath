@@ -1,8 +1,13 @@
-# SatsPath Cryptography Attack Simulations - Results
+# SatsPath Security Simulation Tests & Validation Log
 
-This document contains the execution log and results from the attack simulations run against the core cryptography of SatsPath.
+This document records the execution logs, results, verified security properties, and explicit boundary limitations of automated attack simulations run against SatsPath components.
 
-## Execution Log
+> **Evaluation Methodology:**
+> These simulations validate that specific defensive code paths (signature verifiers, expiry guards, heuristic rail filters, size limiters, and policy flags) execute as intended under simulated adversarial conditions. They validate defense-in-depth mechanisms implemented in the current codebase; they do not mathematically prove absolute security or replace independent third-party security audits.
+
+---
+
+## 1. Core Cryptography & Profile Integrity Simulations
 
 ```text
 running 2 tests
@@ -19,36 +24,32 @@ test test_attack_unauthorized_key_rotation ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-## Conclusions
+### Attack 1: Payload Tampering (In-Transit Modification)
 
-The attack simulations confirm that the core protocol cryptography is robust against server-side tampering.
+* **TEST:** Modifying the receiving Lightning Address in Alice's serialized profile while preserving the original cryptographic signature.
+* **EXPECTED:** Verification fails closed and the tampered profile is rejected.
+* **RESULT:** `verify_signed_profile` recomputed the canonical JSON payload digest (RFC 8785) and verified the BIP-340 Schnorr signature against `identity_pubkey`. Signature validation failed; the tampered profile was rejected.
+* **SECURITY PROPERTY VALIDATED:** In-transit modification of signed profile fields without access to the identity private key is detected by the cryptographic signature verifier.
+* **LIMITATIONS:** Does not prevent a malicious transport from dropping or withholding the profile (denial of service), nor does it authenticate that `identity_pubkey` belongs to a specific real-world human on first contact (TOFU boundary).
 
-### Attack 1: Payload Tampering (Server Malicioso)
+### Attack 2: Unauthorized Key Rotation (Identity Hijacking Attempt)
 
-**Scenario**: A malicious server hosting a user's JSON profile replaces the user's receiving Lightning address with an attacker's address without changing the cryptographic signature.
-**Result**: **PASS**. The `verify_signed_profile` function strictly verifies the SHA256 payload digest and domain-separated prefix against the identity public key. Since the attacker does not hold the user's private key, they cannot generate a valid signature for the modified payload. The tampered profile is explicitly rejected.
+* **TEST:** Injecting an unauthorized `KeyRotation` object signed only by a freshly generated attacker key, without authorization from the victim's existing key.
+* **EXPECTED:** The key rotation validator rejects the transition and preserves the existing identity key.
+* **RESULT:** `is_rotation_valid` rejected the transition. The protocol requires an `AuthorizationV1` statement signed by the active predecessor key (`K1`) alongside an `AcceptanceV1` statement signed by the successor key (`K2`).
+* **SECURITY PROPERTY VALIDATED:** Successor keys cannot unilaterally replace an active identity key without cryptographic authorization signed by the predecessor key.
+* **LIMITATIONS:** Does not protect against an attacker who has compromised the predecessor private key itself. Key recovery without the active private key is deliberately unsupported.
 
-### Attack 2: Unauthorized Key Rotation (Secuestro de Identidad)
+---
 
-**Scenario**: An attacker attempts to hijack a user's alias by injecting a `KeyRotation` object pointing to the attacker's newly generated key. The attacker signs the rotation transition with their own key since they don't hold the original user's private key.
-**Result**: **PASS**. The `is_rotation_valid` protocol validator rejects the rotation. Key rotation transitions must be signed by the _previous_ secret key to authorize the transition. The defense successfully prevented the unauthorized hijack.
-
-> **TIP:**
-> **Production Readiness**
-> The signature and key-rotation foundations are secure. The protocol relies on standard, heavily-tested cryptographic primitives (`secp256k1` Schnorr signatures). Assuming the private keys are generated securely on the user's local device, these vectors are fully protected in production.
-
-# SatsPath Router Security & Attack Simulations - Results
-
-This document contains the execution log and results from the attack simulations run against the core routing logic (`satspath-router`) of SatsPath.
-
-## Execution Log
+## 2. Router Defense & Fallback Simulations
 
 ```text
 running 3 tests
 
 ✅ SETUP: Normal network conditions correctly prioritize On-chain.
 
-⚔️ ATTACK 3: Malicious oracle reports catastrophically high fees (1000 sat/vB) to drain user funds...
+⚔️ ATTACK 3: Malicious oracle reports catastrophically high fees (1000 sat/vB) to force excessive miner fees...
 🛡️ DEFENSE SUCCESS: Router automatically abandoned On-chain due to high fees. Reason: On-chain skipped (fee 1000 sat/vB > 30); using Lightning.
 test test_attack_fee_oracle_manipulation ... ok
 
@@ -63,40 +64,39 @@ test test_attack_extreme_value_liquidity ... ok
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-## Conclusions
+### Attack 3: Fee Oracle Manipulation (Spurious Fee Spike)
 
-The attack simulations confirm that the `satspath-router` incorporates strong defensive heuristics to protect the user's funds and payment reliability under adversarial network conditions.
+* **TEST:** Supplying an extreme simulated on-chain fee rate (1000 sat/vB) to the routing decision engine for a standard-sized payment.
+* **EXPECTED:** Router skips the on-chain rail and selects an advertised low-fee alternative (Lightning).
+* **RESULT:** The fee exceeded `HIGH_FEE_SAT_VB` (30 sat/vB); on-chain routing was skipped and Lightning was selected for the quote.
+* **SECURITY PROPERTY VALIDATED:** Local heuristic fee boundaries prevent generating high-fee on-chain handoff instructions when lower-fee advertised alternatives exist.
+* **LIMITATIONS:** Validates router heuristics only. SatsPath does not execute payments. If all advertised rails report high fees or routing failures, payment handoff generation will fail (`NoRouteFound`).
 
-### Attack 3: Fee Oracle Manipulation (Manipulación de Comisiones)
+### Attack 4: Routing Blackhole & L2 Censorship Fallback
 
-**Scenario**: A malicious oracle or MITM attack feeds catastrophically high on-chain fees (1000 sat/vB) to the router to force the user into spending excessive miner fees.
-**Result**: **PASS**. The router correctly evaluated the fee against the `HIGH_FEE_SAT_VB` threshold (30). It proactively skipped the on-chain rail and safely downgraded to the Lightning Network (L2) to execute the payment cheaply.
+* **TEST:** Simulating simultaneous high on-chain fees and Lightning route unavailability (`routing_ok = false`).
+* **EXPECTED:** Router detects channel route failure and evaluates the next priority rail (Ark).
+* **RESULT:** The router skipped both on-chain and Lightning rails, successfully selecting the advertised Ark (L3) payment pointer as fallback.
+* **SECURITY PROPERTY VALIDATED:** Routing engine implements multi-rail fallback when primary rails report channel or fee constraints.
+* **LIMITATIONS:** Relies on recipient advertising valid alternative payment rails in their profile. Client-side Ark DAG validation and settlement are delegated to the host wallet.
 
-### Attack 4: Routing Blackhole & L2 Censorship (Censura de Enrutamiento L2)
+### Attack 5: Extreme Value Liquidity Route Protection
 
-**Scenario**: The attacker spoofs high on-chain fees to block L1, and simultaneously censors the user's Lightning channels (`routing_ok = false`) to prevent the payment entirely.
-**Result**: **PASS**. The router detected both the L1 fee spike and the L2 routing failure. It successfully executed its final fallback mechanism, selecting the Ark (L3) rail, ensuring the payment could still be completed despite the censorship.
+* **TEST:** Attempting to route a 10 BTC payment through the Lightning rail.
+* **EXPECTED:** Router identifies transaction size exceeding L2 liquidity safety thresholds and chooses an alternative rail.
+* **RESULT:** Transaction amount exceeded `LARGE_PAYMENT_SATS`; the router bypassed Lightning and generated instructions for an alternative rail.
+* **SECURITY PROPERTY VALIDATED:** High-value payments are diverted from off-chain channel routing where liquidity lockups or HTLC routing failures are common.
+* **LIMITATIONS:** Heuristic threshold check only. Does not inspect live Lightning gossip channel balances across public nodes.
 
-### Attack 5: Extreme Value Liquidity Attack (Ataque de Liquidez)
+---
 
-**Scenario**: An attacker generates an excessively large invoice (e.g. 10 BTC) and attempts to force it through Lightning (L2) where it is highly likely to fail or trap liquidity in HTLCs.
-**Result**: **PASS**. The router identified the transaction size as exceeding the `LARGE_PAYMENT_SATS` safety threshold. Even if fees were manipulated to force the router away from L1, it explicitly bypassed Lightning for this massive amount and selected Ark (L3) to protect the user from L2 liquidity traps.
-
-> **TIP:**
-> **Production Readiness**
-> The router's logic operates as a strict, inert priority pipeline. It does not blindly trust external inputs (like fee oracles or requested payment amounts) without subjecting them to internal safety thresholds. These simulations prove the router will fail-safe or gracefully degrade to alternative rails when under attack.
-
-# SatsPath Advanced Security Simulations - Results
-
-This document contains the execution log and results from the advanced network and replay attack simulations run against SatsPath.
-
-## Execution Log
+## 3. Advanced Network & Replay Attack Simulations
 
 ```text
 running 2 tests
 ✅ SETUP: Resolver preparing to fetch remote profiles...
 ⚔️ ATTACK 6: Malicious alias triggers fetches to internal cloud endpoints and loopback IPs...
-🛡️ DEFENSE SUCCESS: Network firewall explicitly blocked all internal/loopback fetches.
+🛡️ DEFENSE SUCCESS: URL validation rejected all tested literal loopback/private/internal destinations.
 test test_attack_ssrf_cloud_metadata ... ok
 
 ✅ SETUP: Generating an old profile from 6 months ago...
@@ -107,29 +107,25 @@ test test_attack_replay_expired_profile ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-## Conclusions
+### Attack 6: SSRF Literal Private IP & Cloud Metadata Guard
 
-The attack simulations confirm that SatsPath is protected against advanced network-level exploits and cryptographic replay attacks.
+* **TEST:** Passing URLs targeting loopback (`127.0.0.1`, `[::1]`), RFC1918 private ranges (`10.0.0.1`, `192.168.1.1`), and cloud metadata (`169.254.169.254`) to `validate_url`.
+* **EXPECTED:** All literal internal, link-local, loopback, and metadata destinations are rejected.
+* **RESULT:** `validate_url` identified the literal IP addresses and blocked hostnames, rejecting each input before any network socket was initialized.
+* **SECURITY PROPERTY VALIDATED:** URL validation blocks literal private/loopback/cloud metadata IP addresses and prohibited host strings.
+* **LIMITATIONS:** Validates literal IP strings and blocked hostnames only. It does not resolve DNS hostnames prior to connection, does not pin resolved IP addresses, does not protect against DNS rebinding (TOCTOU between resolution and TCP connect), and does not inspect HTTP redirect destinations.
 
-### Attack 6: SSRF (Server-Side Request Forgery) Cloud Attack
+### Attack 7: Replay of Expired Historical Profile
 
-**Scenario**: An attacker provides a malicious HTTP identifier (e.g. `hacker@169.254.169.254` or `hacker@[::1]:22`) to trick the SatsPath daemon into making internal network requests, potentially exposing AWS/GCP cloud metadata or exploiting local services.
-**Result**: **PASS**. The `validate_url` function intercepts the resolution intent and blocks all private IPv4/IPv6 addresses, loopbacks, and known cloud metadata domains before opening any TCP socket. The internal network is safe.
+* **TEST:** Replaying a historically valid, correctly signed profile whose `expires_at` timestamp has elapsed.
+* **EXPECTED:** Verification fails closed due to elapsed expiration time.
+* **RESULT:** `check_profile_expiry` compared `expires_at` against the current wall-clock timestamp and returned an expiration error, aborting resolution.
+* **SECURITY PROPERTY VALIDATED:** Correctly signed profiles cannot be indefinitely replayed once their validity window has expired.
+* **LIMITATIONS:** Profiles remain replayable within their active validity window. If a user's keys or payment methods change before `expires_at`, clients without an updated sequence or revocation event may accept the unexpired prior profile until expiration.
 
-### Attack 7: Replay & Expiration Attack (Ataque de Re-ejecución)
+---
 
-**Scenario**: An attacker stores a cryptographically valid profile generated 6 months ago. They replay it to a client today in an attempt to route funds to an old, compromised payment method.
-**Result**: **PASS**. Despite the ECDSA/Schnorr signatures being perfectly valid, the protocol strictly enforces `check_profile_expiry`. The router checks the `expires_at` timestamp against the current wall-clock time and aggressively rejects the zombie profile.
-
-> **TIP:**
-> **Production Readiness**
-> Combined with the previous tests, SatsPath's cryptography, routing heuristics, and network boundaries have proven to be exceptionally robust. The system is safe against tampering, routing censorship, L2 liquidity traps, SSRF, and replay attacks.
-
-# SatsPath P2P Testnet Security Simulations - Results
-
-This document contains the execution log and results from the simulated P2P (Hyperswarm DHT) attack vectors.
-
-## Execution Log
+## 4. P2P Transport & Network Transit Simulations
 
 ```text
 running 2 tests
@@ -137,40 +133,36 @@ running 2 tests
 
 ⚔️ ATTACK 8 (Part 1): Sniffer listens to the Hyperswarm DHT announcements...
 🔍 SNIFFER SEES: Announcing on DHT Topic: 18605124289845250c7d2c090b952b2341e96df723a93033e557020f5bd8b181
-🛡️ DEFENSE SUCCESS: Privacy Rule P2P-03 enforced. Alias is mathematically obfuscated.
+🛡️ DEFENSE SUCCESS: Privacy Rule P2P-03 enforced. Alias is hashed prior to network broadcast.
 test test_attack_p2p_dht_scraping_privacy ... ok
 
 ✅ SETUP: Payload broadcasted to P2P network.
 ⚔️ ATTACK 8 (Part 2): Sniffer intercepts the P2P payload in-transit and modifies the Testnet address...
-🛡️ DEFENSE SUCCESS: The receiving Rust Core detected the P2P MITM corruption and aborted the Testnet payment.
+🛡️ DEFENSE SUCCESS: The receiving Rust Core detected the P2P MITM corruption and aborted wallet-handoff generation.
 test test_attack_p2p_in_transit_corruption ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-## Conclusions
+### Attack 8 (Part 1): P2P DHT Identifier Hashing
 
-The attack simulations confirm that the P2P integration (Pear/Hyperswarm) safely adheres to the SatsPath threat model, protecting both user privacy and payload integrity on untrusted networks like Testnet/Mainnet.
+* **TEST:** Inspecting the topic key announced to the P2P network during identifier publication.
+* **EXPECTED:** Identifier is published under `SHA256(canonical_alias)` rather than cleartext email string.
+* **RESULT:** The transport topic matched the 32-byte SHA-256 digest; cleartext alias was not broadcast as the discovery topic.
+* **SECURITY PROPERTY VALIDATED:** Prevents passive wire-sniffing tools from directly collecting plaintext email addresses from transport routing headers.
+* **LIMITATIONS:** SHA-256 is deterministic and public. Low-entropy identifiers (e.g. `alice@gmail.com`) remain vulnerable to offline dictionary enumeration and rainbow-table attacks. Hashing alone does not provide full anonymity.
 
-### Attack 8 (Part 1): P2P DHT Scraping Privacy
+### Attack 8 (Part 2): P2P In-Transit Payload Corruption
 
-**Scenario**: A malicious node on the Hyperswarm DHT listens to all traffic in an attempt to scrape user aliases (emails) to build a spam list or track users.
-**Result**: **PASS**. As mandated by Privacy Rule P2P-03, the daemon hashes the alias (`SHA256`) before it even touches the network. The attacker only sees an opaque 64-character hash (e.g., `18605124...`). It is mathematically unfeasible to reverse this hash to find the plain text alias, guaranteeing privacy.
+* **TEST:** Modifying an advertised testnet address inside a profile transported over an untrusted P2P transport.
+* **EXPECTED:** The receiving node detects payload tampering via signature mismatch and aborts handoff generation.
+* **RESULT:** `verify_signed_profile` rejected the corrupted payload; handoff generation was aborted.
+* **SECURITY PROPERTY VALIDATED:** Untrusted or compromised network transports cannot alter profile receiving methods without triggering signature failure.
+* **LIMITATIONS:** P2P peers can refuse to relay messages or partition the network (censorship/DoS). Validates payload integrity, not transport availability.
 
-### Attack 8 (Part 2): In-Transit MITM Corruption
+---
 
-**Scenario**: A Man-in-the-Middle (MITM) attacker or malicious P2P node intercepts the JSON profile as it is being downloaded by the payer. The attacker swaps the Testnet Lightning address with their own to steal the testnet coins.
-**Result**: **PASS**. Although the P2P layer successfully transports the modified payload, the receiving Rust Core acts as the final arbiter. The `verify_signed_profile` function recalculates the signature over the corrupted payload, detects the discrepancy, and safely aborts the payment flow.
-
-> **TIP:**
-> **Production Readiness**
-> These tests definitively prove that the P2P transport layer does not require trust. The system's security architecture—where trust is anchored locally via cryptography rather than network transport—functions exactly as intended. The CLI and GUI clients can safely operate on Mainnet or Testnet over public, untrusted networks.
-
-# SatsPath Extreme Security Simulations - Results
-
-This document contains the execution log and results from extreme boundary testing (DoS, Downgrades, DNS Spoofing).
-
-## Execution Log
+## 5. Protocol Boundaries, DoS & DNSSEC Simulations
 
 ```text
 running 3 tests
@@ -182,32 +174,37 @@ test test_attack_memory_exhaustion_dos ... ok
 
 ✅ SETUP: User requires Post-Quantum Cryptography (pqc_required = true)...
 ⚔️ ATTACK 10: Attacker intercepts JSON and switches pqc_required to FALSE to downgrade security...
-🛡️ DEFENSE SUCCESS: Cryptographic downgrade is impossible. The Schnorr signature covers the PQC flag and explicitly rejected the modification.
+🛡️ DEFENSE SUCCESS: Cryptographic downgrade rejected. The Schnorr signature covers the canonical profile including the PQC flag and explicitly rejects modified payloads.
 test test_attack_pqc_downgrade ... ok
 
 ✅ SETUP: Analyzing DNS BIP-353 Resolver configuration...
 ⚔️ ATTACK 11: Malicious Wi-Fi attempts to poison DNS cache and return fake TXT records...
-🛡️ DEFENSE SUCCESS: DNSSEC validation is strictly enforced by default (`opts.validate = true`). Untrusted DNS responses will be rejected by the protocol layer.
+🛡️ DEFENSE SUCCESS: Strict DNSSEC policy rejected the unauthenticated result. The default DoH backend does not independently validate DNSSEC, so Strict mode fails closed unless authenticated DNSSEC evidence is available.
 test test_attack_dns_spoofing ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
 
-## Conclusions
+### Attack 9: DoS Memory Exhaustion (OOM Payload Bomb)
 
-The protocol safely handles extreme attacks aiming at infrastructure stability, cryptographic downgrades, and DNS network manipulation.
+* **TEST:** Serving a 5MB payload to an HTTP resolver configured with a 50KB maximum size ceiling.
+* **EXPECTED:** Stream is terminated as soon as downloaded bytes exceed 50KB, without buffering into memory.
+* **RESULT:** The resolver aborted the download stream upon crossing the 50KB threshold with a payload size limit error.
+* **SECURITY PROPERTY VALIDATED:** Memory exhaustion from oversized or unbounded HTTP response payloads is prevented by stream-level size gating.
+* **LIMITATIONS:** Protects local process memory against single large payloads. Does not protect against resource exhaustion caused by high concurrency or connection exhaustion.
 
-### Attack 9: DoS Memory Exhaustion (JSON Bomb)
+### Attack 10: Post-Quantum Flag Downgrade Attempt
 
-**Scenario**: A malicious HTTP server attempts to crash the local node by sending a 5GB file instead of a JSON profile.
-**Result**: **PASS (Patched)**. The HTTP resolver enforces a strict 50KB chunk size limit. When the downloaded bytes exceed the limit, the connection is instantly severed, saving the process from an Out-of-Memory (OOM) crash.
+* **TEST:** Modifying the `pqc_required: true` field to `false` in a profile that includes post-quantum public keys.
+* **EXPECTED:** Classical signature verification fails because the canonical JSON hash includes all profile flags.
+* **RESULT:** The signature check over the altered payload failed immediately; downgrade attempt rejected.
+* **SECURITY PROPERTY VALIDATED:** Profile security policy flags cannot be toggled in transit without invalidating the outer BIP-340 signature.
+* **LIMITATIONS:** PQC signatures (`crates/satspath-pqc`) are an experimental research module (ML-DSA-65) and are not part of the production safety claim.
 
-### Attack 10: PQC Downgrade Attempt
+### Attack 11: DNS Cache Spoofing (BIP-353 Strict Policy)
 
-**Scenario**: An attacker modifies the JSON profile in-transit to remove the `pqc_required: true` flag, hoping to trick the client into accepting a classical-only signature.
-**Result**: **PASS**. The classical signature validates the entire canonical JSON string. Altering the PQC flag invalidates the classical signature instantly.
-
-### Attack 11: DNS Spoofing (BIP-353)
-
-**Scenario**: The user's DNS queries are intercepted by a compromised router which serves fake BIP-353 TXT records.
-**Result**: **PASS**. The DNS resolver enforces DNSSEC cryptographic signatures. Unsigned or maliciously signed DNS records are rejected at the network layer.
+* **TEST:** Presenting unauthenticated or unsigned DNS TXT records to the BIP-353 resolver under default `DnssecPolicy::Strict`.
+* **EXPECTED:** Resolver refuses to return unauthenticated DNS payment instructions and fails closed.
+* **RESULT:** Strict policy rejected records where `dnssec_validated == false`, returning `SatsPathError::DnssecUnavailable`.
+* **SECURITY PROPERTY VALIDATED:** Strict mode fails closed on unauthenticated DNS records, refusing to process unauthenticated payment instructions.
+* **LIMITATIONS:** The default DoH resolver backend does not locally validate the DNSSEC cryptographic chain; it queries upstream resolvers and sets `dnssec_validated = false`. Consequently, Strict mode fails closed unless an authenticated DNS environment or custom validating resolver is provided.

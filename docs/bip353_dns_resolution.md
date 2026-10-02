@@ -115,10 +115,10 @@ BIP-353 requires publishing a DNS record under the **domain** of the name. A use
 of `rodrigo@gmail.com` cannot publish `rodrigo.user._bitcoin-payment.gmail.com`
 because they do not control `gmail.com`.
 
-> SatsPath can resolve DNSSEC-backed BIP-353 payment instructions for domains the
-> receiver controls. For consumer email addresses like `gmail.com`, SatsPath uses
-> platform verification / the invite flow instead, because the user cannot publish
-> DNS records under `gmail.com`.
+> SatsPath can resolve DNSSEC-backed BIP-353 payment instructions for domains where
+> DNS records can be published (either by domain owners, administrators, or cooperating providers).
+> For standard consumer email addresses (e.g. `alice@gmail.com`) where the provider does not publish
+> BIP-353 records, SatsPath uses alternative transports (HTTPS S2S, Nostr) or the invite flow.
 
 ## Rotating payment instructions
 
