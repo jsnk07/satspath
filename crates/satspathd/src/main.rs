@@ -375,12 +375,14 @@ mod tests {
         assert!(not_found.is_err());
     }
 
+    /// Start a plain-HTTP loopback test daemon.
     async fn start_test_daemon(
         config: rate_limit::RateLimiterConfig,
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
         start_test_daemon_full(config, None).await
     }
 
+    /// Start a loopback test daemon, optionally serving TLS.
     async fn start_test_daemon_full(
         config: rate_limit::RateLimiterConfig,
         ssl_config: Option<tiny_http::SslConfig>,
@@ -434,6 +436,7 @@ mod tests {
         (format!("{scheme}://{url_addr}"), server, handle)
     }
 
+    /// The per-client rate limiter allows the burst, then answers 429.
     #[tokio::test]
     async fn test_http_rate_limit_and_burst_protection() {
         let config = rate_limit::RateLimiterConfig {

@@ -101,6 +101,7 @@ pub(crate) fn json_result<T: Serialize>(
     }
 }
 
+/// Serialize `body` as a JSON response with `status`.
 pub(crate) fn json_response<T: Serialize>(
     status: StatusCode,
     value: &T,
@@ -115,6 +116,7 @@ pub(crate) fn json_response<T: Serialize>(
         .with_header(cors_headers_header())
 }
 
+/// A response with the given status and no body.
 pub(crate) fn empty_response(status: StatusCode) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_data(Vec::new())
         .with_status_code(status)
