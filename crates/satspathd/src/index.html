@@ -673,14 +673,29 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
   // Owner-only endpoints need the daemon's admin token as a Bearer header. It is
-  // kept in sessionStorage (this tab only) and never sent to any other origin.
-  const ADMIN_TOKEN_KEY = "satspathd-admin-token";
-  const adminToken = () => { try { return sessionStorage.getItem(ADMIN_TOKEN_KEY) || ""; } catch (_) { return ""; } };
-  const setAdminToken = (t) => { try { sessionStorage.setItem(ADMIN_TOKEN_KEY, t); } catch (_) {} };
+  // held in memory only (never written to web storage, so it is gone on reload)
+  // and only ever sent to this daemon.
+  let adminTokenValue = "";
+  const adminToken = () => adminTokenValue;
+  const setAdminToken = (t) => { adminTokenValue = t; };
   const adminFetch = (url, opts = {}) => {
     const token = adminToken();
     const headers = Object.assign({}, opts.headers || {}, token ? {Authorization: "Bearer " + token} : {});
     return fetch(url, Object.assign({}, opts, {headers}));
+  };
+  // Render an admin-token form into `box`; `onUnlock` runs after it is entered.
+  const promptAdminToken = (box, message, onUnlock) => {
+    box.innerHTML = `
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <span>${esc(message)}</span>
+        <input class="admin-token-input" type="password" autocomplete="off" placeholder="SATSPATHD_AUTH_TOKEN" style="flex:1; min-width:180px;">
+        <button class="action admin-token-save" style="width:auto; padding:6px 14px; margin:0; font-size:12px;">Unlock</button>
+      </div>`;
+    box.querySelector(".admin-token-save").onclick = () => {
+      setAdminToken(box.querySelector(".admin-token-input").value.trim());
+      onUnlock();
+    };
+    show(box);
   };
 
   const fireLasers = (colorClass) => {
@@ -848,10 +863,14 @@
       const amount_sats = parseInt($("s-amount").value, 10);
       if (!recipient || !amount_sats) throw new Error("Enter a recipient and an amount.");
       
-      const r = await fetch("/v1/send", {
+      const r = await adminFetch("/v1/send", {
         method: "POST", headers: {"content-type": "application/json"},
         body: JSON.stringify({recipient, amount_sats})
       });
+      if (r.status === 401) {
+        promptAdminToken(err, "Enter the daemon admin token to send.", () => $("s-go").click());
+        return;
+      }
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       
@@ -1008,17 +1027,7 @@
       const box = $("s-notifications");
       const r = await adminFetch("/v1/invites/notifications");
       if (r.status === 401) {
-        box.innerHTML = `
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <span>Enter the daemon admin token to see invite notifications.</span>
-            <input id="s-admin-token" type="password" autocomplete="off" placeholder="SATSPATHD_AUTH_TOKEN" style="flex:1; min-width:180px;">
-            <button class="action" id="s-admin-token-save" style="width:auto; padding:6px 14px; margin:0; font-size:12px;">Unlock</button>
-          </div>`;
-        $("s-admin-token-save").onclick = () => {
-          setAdminToken($("s-admin-token").value.trim());
-          loadNotifications();
-        };
-        show(box);
+        promptAdminToken(box, "Enter the daemon admin token to see invite notifications.", loadNotifications);
         return;
       }
       if (!r.ok) return;
@@ -1144,6 +1153,10 @@
         headers: {"content-type": "application/json"},
         body: JSON.stringify(body)
       });
+      if (r.status === 401) {
+        promptAdminToken(err, "Enter the daemon admin token to claim this invite.", () => $("c-claim-go").click());
+        return;
+      }
       const d = await r.json();
       if (d.error) throw new Error(d.error);
 

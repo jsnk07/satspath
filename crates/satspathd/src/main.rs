@@ -523,6 +523,25 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
 
+        // /v1/send can create and store an invite, so it is owner-only too.
+        let send_body =
+            serde_json::json!({ "recipient": "carol@example.com", "amount_sats": 1000 });
+        let res = client
+            .post(format!("{base_url}/v1/send"))
+            .json(&send_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let res = client
+            .post(format!("{base_url}/v1/send"))
+            .bearer_auth("test_token")
+            .json(&send_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+
         for path in ["/v1/invites", "/v1/invites/notifications"] {
             let res = client
                 .get(format!("{base_url}{path}"))
