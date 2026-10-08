@@ -102,11 +102,7 @@ pub async fn cmd_pay(
     validate_compressed_pubkey(&signed.profile.identity_pubkey)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("  Signature valid.");
-    if signed.profile.revoked {
-        anyhow::bail!(
-            "Profile has been REVOKED by its owner. Do not pay this key. Aborting preview."
-        );
-    }
+    ensure_not_revoked(&signed.profile)?;
 
     println!("Selecting public payment route...");
     let req = RouteRequest {
@@ -171,6 +167,16 @@ pub async fn cmd_pay(
 
     for line in preview_safety_lines() {
         println!("{line}");
+    }
+    Ok(())
+}
+
+/// Abort before route selection if the recipient's owner revoked the profile.
+fn ensure_not_revoked(profile: &satspath_core::PaymentProfile) -> Result<()> {
+    if profile.revoked {
+        anyhow::bail!(
+            "Profile has been REVOKED by its owner. Do not pay this key. Aborting preview."
+        );
     }
     Ok(())
 }
@@ -523,6 +529,29 @@ mod tests {
         assert!(joined.contains("no funds moved"));
         assert!(joined.contains("no signing performed"));
         assert!(!joined.contains("broadcast"));
+    }
+
+    #[test]
+    fn revoked_profile_is_refused_before_routing() {
+        let mut profile = satspath_core::PaymentProfile {
+            alias: "gone@satspath.dev".into(),
+            identity_pubkey: "02".to_string() + &"11".repeat(32),
+            methods: vec![],
+            updated_at: 0,
+            expires_at: None,
+            sequence: Some(0),
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: vec![],
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: false,
+        };
+        assert!(ensure_not_revoked(&profile).is_ok());
+        profile.revoked = true;
+        let err = ensure_not_revoked(&profile).unwrap_err().to_string();
+        assert!(err.contains("REVOKED"), "{err}");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use satspath_core::resolver::{ChainResolver, ProfileResolver};
 use satspath_core::resolvers::http::HttpResolver;
 use satspath_core::{Result, SatsPathError, SignedPaymentProfile};
 
+/// A validly signed profile for `alias` with the given revocation flag.
 fn signed_profile(alias: &str, revoked: bool) -> SignedPaymentProfile {
     let kp = generate_identity_keypair();
     let profile = PaymentProfile {
@@ -41,6 +42,7 @@ fn signed_profile(alias: &str, revoked: bool) -> SignedPaymentProfile {
     sign_profile(profile, &kp.secret_key).expect("sign")
 }
 
+/// The HTTPS resolver refuses a correctly signed but revoked profile.
 #[tokio::test]
 async fn http_resolver_must_reject_revoked_profile() {
     let mut server = Server::new_async().await;
@@ -73,6 +75,7 @@ impl ProfileResolver for FixedResolver {
     }
 }
 
+/// ChainResolver stops on a revoked profile instead of trying the next transport.
 #[tokio::test]
 async fn resolver_chain_must_reject_revoked_profile_from_any_transport() {
     let chain = ChainResolver::new()
@@ -89,6 +92,7 @@ async fn resolver_chain_must_reject_revoked_profile_from_any_transport() {
     );
 }
 
+/// The revocation guard does not reject ordinary, non-revoked profiles.
 #[tokio::test]
 async fn non_revoked_profile_still_resolves() {
     let mut server = Server::new_async().await;
