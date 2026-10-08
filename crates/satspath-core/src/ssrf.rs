@@ -209,6 +209,31 @@ pub struct ValidatedTarget {
 /// Upper bound on resolving a URL's hostname in [`resolve_and_validate`].
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Resolve `domain` to its IP addresses within [`DNS_LOOKUP_TIMEOUT`].
+///
+/// Uses hickory's async resolver configured from the system (`/etc/resolv.conf`
+/// and the hosts file), so lookups go to the same servers as the rest of the
+/// machine. Unlike `tokio::net::lookup_host`, which runs blocking `getaddrinfo`
+/// on a thread the timeout cannot stop, dropping this future on timeout ends
+/// the DNS work, so slow or hostile domains cannot pile up resolver threads.
+async fn lookup_ips(domain: &str) -> Result<Vec<IpAddr>> {
+    let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf().map_err(|e| {
+        SatsPathError::NetworkError(format!("cannot load system DNS configuration: {e}"))
+    })?;
+    let lookup = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, resolver.lookup_ip(domain))
+        .await
+        .map_err(|_| {
+            SatsPathError::NetworkError(format!(
+                "DNS resolution timed out for {domain} after {}s",
+                DNS_LOOKUP_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            SatsPathError::NetworkError(format!("DNS resolution failed for {domain}: {e}"))
+        })?;
+    Ok(lookup.iter().collect())
+}
+
 /// Validate `url` with [`validate_url`], resolve its host, and check every
 /// resolved address with [`check_resolved_addrs`].
 pub async fn resolve_and_validate(url: &str, allow_http: bool) -> Result<ValidatedTarget> {
@@ -223,26 +248,7 @@ pub async fn resolve_and_validate(url: &str, allow_http: bool) -> Result<Validat
     let (host, ips): (String, Vec<IpAddr>) = match parsed.host() {
         Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
         Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
-        Some(url::Host::Domain(domain)) => {
-            // pinned_client's timeout only starts after resolution, so bound the lookup
-            // itself; otherwise a slow or hostile DNS server can stall the resolver.
-            let resolved =
-                tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((domain, port)))
-                    .await
-                    .map_err(|_| {
-                        SatsPathError::NetworkError(format!(
-                            "DNS resolution timed out for {domain} after {}s",
-                            DNS_LOOKUP_TIMEOUT.as_secs()
-                        ))
-                    })?
-                    .map_err(|e| {
-                        SatsPathError::NetworkError(format!(
-                            "DNS resolution failed for {domain}: {e}"
-                        ))
-                    })?;
-            let ips = resolved.map(|sa| sa.ip()).collect();
-            (domain.to_string(), ips)
-        }
+        Some(url::Host::Domain(domain)) => (domain.to_string(), lookup_ips(domain).await?),
         None => return Err(SatsPathError::ValidationError("URL has no host".into())),
     };
 
@@ -282,6 +288,7 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether an IPv4 address is in a range a resolver must never contact.
 fn is_private_v4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     // Loopback: 127.0.0.0/8
@@ -341,6 +348,7 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
     false
 }
 
+/// Whether an IPv6 address is internal, including IPv6 forms that embed an IPv4 address.
 fn is_private_v6(ip: Ipv6Addr) -> bool {
     // Loopback: ::1
     if ip.is_loopback() {
@@ -386,6 +394,7 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     false
 }
 
+/// The IPv4 address carried in two IPv6 segments.
 fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
     Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
 }
@@ -474,6 +483,7 @@ mod tests {
         assert!(validate_url("https://100.100.100.100/profile", false).is_err());
     }
 
+    /// Internal-only suffixes (.internal, .local, ...) are refused before any lookup.
     #[test]
     fn internal_suffix_hostnames_blocked() {
         for host in [
@@ -495,6 +505,7 @@ mod tests {
         assert!(validate_url("https://internal.example.com/p", false).is_ok());
     }
 
+    /// NAT64, 6to4, Teredo and IPv4-compatible addresses carrying a private IPv4 are blocked.
     #[test]
     fn embedded_private_ipv4_blocked() {
         assert!(validate_url("https://169.254.169.254.nip.io/p", false).is_err());
@@ -505,6 +516,7 @@ mod tests {
         assert!(validate_url("https://93.184.215.14.nip.io/p", false).is_ok());
     }
 
+    /// Reserved, multicast and benchmarking ranges are blocked.
     #[test]
     fn extended_reserved_ranges_blocked() {
         for ip in [
@@ -531,6 +543,7 @@ mod tests {
         assert!(!is_private_or_reserved("64:ff9b::808:808".parse().unwrap()));
     }
 
+    /// One private address among a hostname's results is enough to refuse it.
     #[test]
     fn resolved_addresses_checked() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -540,6 +553,7 @@ mod tests {
         assert!(check_resolved_addrs("h", &[ip("1.1.1.1")]).is_ok());
     }
 
+    /// Private literals and blocked names fail before any DNS lookup.
     #[tokio::test]
     async fn resolve_and_validate_rejects_private_literal_before_lookup() {
         assert!(resolve_and_validate("https://10.0.0.1/p", false)
@@ -550,6 +564,7 @@ mod tests {
             .is_err());
     }
 
+    /// A public literal is pinned to exactly that address.
     #[tokio::test]
     async fn resolve_and_validate_pins_public_literal() {
         let target = resolve_and_validate("https://1.1.1.1/p", false)
@@ -557,5 +572,16 @@ mod tests {
             .unwrap();
         assert_eq!(target.addrs, vec!["1.1.1.1:443".parse().unwrap()]);
         assert!(pinned_client(&target, Duration::from_secs(1)).is_ok());
+    }
+
+    /// The async resolver honors the system hosts file, and what it returns is
+    /// still subject to the private-address check.
+    #[tokio::test]
+    async fn system_resolver_reads_hosts_file_and_result_is_checked() {
+        let ips = lookup_ips("localhost")
+            .await
+            .expect("localhost resolves via hosts file");
+        assert!(ips.iter().all(|ip| ip.is_loopback()), "{ips:?}");
+        assert!(check_resolved_addrs("localhost", &ips).is_err());
     }
 }

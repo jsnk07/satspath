@@ -14,6 +14,7 @@ use std::net::IpAddr;
 
 use satspath_core::ssrf::{check_resolved_addrs, validate_url};
 
+/// Internal hostnames must be rejected by URL validation alone.
 #[test]
 fn ssrf_guard_must_cover_internal_hostnames() {
     // Baseline: the metadata IP literal is blocked.
@@ -47,6 +48,7 @@ fn ssrf_guard_must_cover_internal_hostnames() {
     assert!(validate_url("https://pay.satspath.dev/.well-known/satspath/alice", false).is_ok());
 }
 
+/// A public-looking hostname that resolves to an internal address must be rejected.
 #[test]
 fn ssrf_guard_must_check_resolved_addresses() {
     let ip = |s: &str| s.parse::<IpAddr>().unwrap();

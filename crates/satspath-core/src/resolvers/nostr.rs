@@ -74,6 +74,7 @@ impl NostrResolver {
         }
     }
 
+    /// Look up the NIP-05 record for `alias` over a pinned, SSRF-checked connection.
     async fn resolve_nip05(&self, alias: &str) -> Result<Nip05Resolution> {
         let canonical = canonicalize_identifier(alias);
         let (name, domain) = canonical
@@ -135,6 +136,7 @@ impl NostrResolver {
         Ok(Nip05Resolution { pubkey, relays })
     }
 
+    /// Fetch the profile event from one relay after validating its address.
     async fn query_relay(
         &self,
         relay: &str,
