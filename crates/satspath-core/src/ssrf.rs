@@ -504,6 +504,7 @@ mod tests {
         assert!(validate_url("ftp://example.com/profile", false).is_err());
     }
 
+    /// Carrier-grade NAT (100.64.0.0/10) is blocked.
     #[test]
     fn carrier_grade_nat_blocked() {
         assert!(validate_url("https://100.100.100.100/profile", false).is_err());

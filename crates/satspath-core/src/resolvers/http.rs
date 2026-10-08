@@ -200,6 +200,7 @@ mod tests {
 
     // ── Test 1: Valid profile — success ───────────────────────────────────────
 
+    /// A valid signed profile from the mock server resolves.
     #[tokio::test]
     async fn valid_profile_resolves_ok() {
         let mut server = Server::new_async().await;
@@ -228,6 +229,7 @@ mod tests {
 
     // ── Test 2: Invalid signature — rejected ──────────────────────────────────
 
+    /// A profile with a bad signature is rejected.
     #[tokio::test]
     async fn invalid_signature_rejected() {
         let mut server = Server::new_async().await;
@@ -259,6 +261,7 @@ mod tests {
 
     // ── Test 3: Expired profile — rejected ────────────────────────────────────
 
+    /// An expired profile is rejected.
     #[tokio::test]
     async fn expired_profile_rejected() {
         let mut server = Server::new_async().await;
@@ -286,6 +289,7 @@ mod tests {
 
     // ── Test 4: 404 → AliasNotFound ───────────────────────────────────────────
 
+    /// A 404 maps to AliasNotFound.
     #[tokio::test]
     async fn not_found_404() {
         let mut server = Server::new_async().await;
@@ -309,6 +313,7 @@ mod tests {
 
     // ── Test 5: 5xx server error → NetworkError ───────────────────────────────
 
+    /// A 5xx maps to a network error.
     #[tokio::test]
     async fn server_error_5xx() {
         let mut server = Server::new_async().await;
@@ -332,6 +337,7 @@ mod tests {
 
     // ── Test 6: Malformed JSON → SerializationError ───────────────────────────
 
+    /// Malformed JSON is rejected.
     #[tokio::test]
     async fn malformed_json_rejected() {
         let mut server = Server::new_async().await;

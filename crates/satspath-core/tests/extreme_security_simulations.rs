@@ -29,6 +29,7 @@ fn create_pqc_profile() -> PaymentProfile {
     }
 }
 
+/// A 5 MB response is aborted by the 50 KB download limit.
 #[tokio::test]
 async fn test_attack_memory_exhaustion_dos() {
     println!("✅ SETUP: Resolver configured with 50KB DoS protection limit...");

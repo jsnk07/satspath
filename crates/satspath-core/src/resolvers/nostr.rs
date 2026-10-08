@@ -62,6 +62,7 @@ impl Default for NostrResolver {
 }
 
 impl NostrResolver {
+    /// A resolver using SATSPATH_NOSTR_RELAYS or the default relays as fallback.
     pub fn new() -> Self {
         Self {
             fallback_relays: env_relays().unwrap_or_else(|| {
@@ -73,6 +74,7 @@ impl NostrResolver {
         }
     }
 
+    /// A resolver with explicit fallback relays.
     pub fn with_relays(relays: Vec<String>) -> Self {
         Self {
             fallback_relays: relays,
@@ -314,6 +316,7 @@ fn signed_profile_from_event(
     Ok(Some(signed))
 }
 
+/// Whether `event` carries the tag `[tag_name, tag_value]`.
 fn event_has_tag(event: &Value, tag_name: &str, tag_value: &str) -> bool {
     event
         .get("tags")
@@ -538,6 +541,7 @@ mod tests {
         assert_eq!(parsed.profile.alias, "alice@example.com");
     }
 
+    /// An event for a different alias is ignored.
     #[test]
     fn rejects_event_for_wrong_alias() {
         let profile = signed("bob@example.com");
