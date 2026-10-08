@@ -482,6 +482,7 @@ mod tests {
         assert!(validate_nostr_pubkey("npub1abc").is_err());
     }
 
+    /// A kind-30078 event's content parses into the signed profile.
     #[test]
     fn parses_signed_profile_event_content() {
         let profile = signed("alice@example.com");

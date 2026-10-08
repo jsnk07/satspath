@@ -514,6 +514,7 @@ fn display_value(value: &str, mask: fn(&str) -> String, debug: bool) -> String {
     }
 }
 
+/// Human-readable network name.
 fn network_name(network: BitcoinNetwork) -> &'static str {
     match network {
         BitcoinNetwork::Mainnet => "mainnet",

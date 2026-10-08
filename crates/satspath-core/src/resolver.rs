@@ -151,6 +151,7 @@ impl ChainResolver {
 }
 
 impl Default for ChainResolver {
+    /// An empty chain.
     fn default() -> Self {
         Self::new()
     }

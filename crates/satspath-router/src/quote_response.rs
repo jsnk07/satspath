@@ -425,6 +425,7 @@ mod tests {
     use satspath_core::{BitcoinNetwork, PaymentProfile, SignedPaymentProfile};
 
     // Deterministic fees: cheap next block (on-chain viable when a method exists).
+    /// A low fee estimate that keeps on-chain routes viable.
     fn cheap_fees() -> FeeEstimate {
         FeeEstimate {
             fastest_fee: 5,
