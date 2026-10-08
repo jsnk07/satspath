@@ -187,7 +187,7 @@ mod tests {
     use crate::server::{audit_binding_security, serve_server};
     use crate::types::{now, PayRequest, PayResponse, QuoteRequest, SendRequest, SendResponse};
 
-    /// Daemon state for tests, rooted at .
+    /// Daemon state for tests, rooted at `home`.
     fn test_state(home: &Path) -> AppState {
         AppState {
             home: home.to_owned(),

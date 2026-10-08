@@ -101,7 +101,7 @@ impl Registry {
         self.update_profile_for(&requested, signed)
     }
 
-    /// Overwrite the profile registered under  after validating it.
+    /// Overwrite the profile registered under `requested_alias` after validating it.
     pub fn update_profile_for(
         &mut self,
         requested_alias: &str,

@@ -506,6 +506,7 @@ fn display_payload(pointer: &PaymentPointer, payload: &str, debug: bool) -> Stri
     }
 }
 
+/// Show `value` in full with --debug, masked otherwise.
 fn display_value(value: &str, mask: fn(&str) -> String, debug: bool) -> String {
     if debug {
         value.to_string()

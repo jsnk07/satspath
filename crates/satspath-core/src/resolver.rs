@@ -144,6 +144,7 @@ impl ChainResolver {
         }
     }
 
+    /// Append `resolver` to the chain.
     pub fn push<R: ProfileResolver + Send + Sync + 'static>(mut self, resolver: R) -> Self {
         self.resolvers.push(Box::new(resolver));
         self
