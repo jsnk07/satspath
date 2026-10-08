@@ -55,13 +55,17 @@ fn ssrf_guard_must_check_resolved_addresses() {
 
     // A public-looking hostname whose A record points at cloud metadata.
     assert!(check_resolved_addrs("internal.attacker.example", &[ip("169.254.169.254")]).is_err());
-    // Loopback, RFC 1918, IPv6 ULA and IPv4-mapped loopback.
+    // Loopback, RFC 1918, IPv6 ULA and site-local, IPv4-mapped loopback, and
+    // IPv6 special-use ranges (Teredo, local-use NAT64).
     for bad in [
         "127.0.0.1",
         "10.0.0.7",
         "192.168.0.10",
         "fd00::1",
+        "fec0::1",
         "::ffff:127.0.0.1",
+        "2001::1",
+        "64:ff9b:1::a00:1",
     ] {
         assert!(
             check_resolved_addrs("attacker.example", &[ip(bad)]).is_err(),
