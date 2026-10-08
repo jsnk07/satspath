@@ -25,6 +25,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::proto::rr::RecordType;
+// Compile-time guard: this type only exists when hickory is built with DNSSEC
+// support. Without it, `validate = true` silently degrades to unvalidated
+// lookups, which would make every record below falsely "validated".
+#[allow(unused_imports)]
+use hickory_resolver::proto::xfer::DnssecDnsHandle as _;
 use hickory_resolver::TokioAsyncResolver;
 
 use crate::bip353::{
@@ -113,9 +118,12 @@ impl Default for HickoryDnssecTxtResolver {
 }
 
 impl HickoryDnssecTxtResolver {
+    /// A resolver that validates DNSSEC locally, querying Cloudflare's servers.
     pub fn new() -> Self {
         let mut opts = ResolverOpts::default();
         opts.validate = true;
+        // Local hosts-file answers carry no DNSSEC proof; never consult them.
+        opts.use_hosts_file = false;
         Self {
             resolver: TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), opts),
             validating: true,

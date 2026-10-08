@@ -7,11 +7,13 @@
 //!
 //! # DNSSEC is mandatory
 //!
-//! Per BIP-353 all payment instructions must be DNSSEC-signed. This crate does
-//! not ship a local DNSSEC validator, so the default [`resolve_bip353`] runs in
-//! [`DnssecPolicy::Strict`] and **fails closed** ([`SatsPathError::DnssecUnavailable`])
-//! rather than trusting an upstream resolver's AD bit. [`DnssecPolicy::DevInsecure`]
-//! exists for local testing only, is never the default, and emits loud warnings.
+//! Per BIP-353 all payment instructions must be DNSSEC-signed. The default
+//! [`resolve_bip353`] validates DNSSEC locally against the root trust anchor
+//! (see [`crate::resolvers::bip353::HickoryDnssecTxtResolver`]) under
+//! [`DnssecPolicy::Strict`] and **fails closed** ([`SatsPathError::DnssecUnavailable`]
+//! or a lookup error) rather than trusting an upstream resolver's AD bit.
+//! [`DohTxtResolver`] cannot validate and is only usable with [`DnssecPolicy::DevInsecure`],
+//! which exists for local testing only, is never the default, and emits loud warnings.
 
 use std::collections::HashMap;
 
@@ -231,14 +233,13 @@ where
     })
 }
 
-/// Resolve a BIP-353 name with the default backend and **Strict** policy.
+/// Resolve a BIP-353 name with local DNSSEC validation and **Strict** policy.
 ///
-/// The default backend does not perform local DNSSEC validation, so in Strict
-/// mode this fails closed with [`SatsPathError::DnssecUnavailable`]. Use
-/// [`resolve_bip353_with`] + a DNSSEC-validating resolver (or `DevInsecure` for
-/// local testing) to obtain a resolution.
+/// Uses [`crate::resolvers::bip353::HickoryDnssecTxtResolver`], which drops any
+/// record that does not chain-validate to the root trust anchor, so unsigned
+/// zones and broken chains fail closed.
 pub async fn resolve_bip353(name: &str) -> Result<Bip353Resolution> {
-    let resolver = DohTxtResolver::new();
+    let resolver = crate::resolvers::bip353::HickoryDnssecTxtResolver::new();
     let now = chrono::Utc::now().timestamp();
     resolve_bip353_with(&resolver, name, DnssecPolicy::Strict, now).await
 }
