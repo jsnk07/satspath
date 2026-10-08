@@ -67,8 +67,26 @@ pub enum KeyContinuity {
 /// Storage for pinned identity keys. Keys are looked up by identifier; the raw
 /// identifier is never persisted (see [`hash_identifier`]).
 pub trait TrustedKeyStore: Send + Sync {
+    /// The key currently pinned for `identifier`, if any.
     fn trusted_key(&self, identifier: &str) -> Result<Option<TrustedKey>>;
+    /// Pin `key` for `identifier`, replacing any previous pin.
     fn pin_key(&self, identifier: &str, key: TrustedKey) -> Result<()>;
+
+    /// Atomically read the pin for `identifier`, let `decide` check it, and
+    /// store the pin `decide` returns (`None` leaves it unchanged). Stores shared
+    /// between processes must hold their lock across the whole call so a
+    /// concurrent writer cannot interleave between the check and the write.
+    fn update_pin(
+        &self,
+        identifier: &str,
+        decide: &mut dyn FnMut(Option<&TrustedKey>) -> Result<Option<TrustedKey>>,
+    ) -> Result<()> {
+        let current = self.trusted_key(identifier)?;
+        if let Some(next) = decide(current.as_ref())? {
+            self.pin_key(identifier, next)?;
+        }
+        Ok(())
+    }
 }
 
 /// Decide whether `signed` keeps key continuity with `pinned`.
@@ -125,6 +143,7 @@ pub struct PinnedResolver<R> {
 }
 
 impl<R: ProfileResolver + Send + Sync> PinnedResolver<R> {
+    /// Wrap `inner` so every resolution is checked against `store`.
     pub fn new(inner: R, store: Arc<dyn TrustedKeyStore>) -> Self {
         Self { inner, store }
     }
@@ -148,30 +167,33 @@ impl<R: ProfileResolver + Send + Sync> PinnedResolver<R> {
             return Err(SatsPathError::InvalidSignature);
         }
 
-        let pinned = self.store.trusted_key(alias)?;
-        let continuity = check_key_continuity(alias, pinned.as_ref(), &signed)?;
+        // Check and pin in one store transaction, so a concurrent resolver in
+        // another process cannot change the pin between the check and the write.
+        let mut continuity = None;
+        self.store.update_pin(alias, &mut |pinned| {
+            continuity = Some(check_key_continuity(alias, pinned, &signed)?);
 
-        let now = chrono::Utc::now().timestamp();
-        let sequence = signed.profile.sequence.unwrap_or(0);
-        let updated = TrustedKey {
-            identity_pubkey: signed.profile.identity_pubkey.clone(),
-            sequence: pinned
-                .as_ref()
-                .filter(|p| p.identity_pubkey == signed.profile.identity_pubkey)
-                .map_or(sequence, |p| p.sequence.max(sequence)),
-            first_seen: pinned.as_ref().map_or(now, |p| p.first_seen),
-            updated_at: now,
-        };
-        if pinned.as_ref() != Some(&updated) {
-            self.store.pin_key(alias, updated)?;
-        }
+            let now = chrono::Utc::now().timestamp();
+            let sequence = signed.profile.sequence.unwrap_or(0);
+            let updated = TrustedKey {
+                identity_pubkey: signed.profile.identity_pubkey.clone(),
+                sequence: pinned
+                    .filter(|p| p.identity_pubkey == signed.profile.identity_pubkey)
+                    .map_or(sequence, |p| p.sequence.max(sequence)),
+                first_seen: pinned.map_or(now, |p| p.first_seen),
+                updated_at: now,
+            };
+            Ok((pinned != Some(&updated)).then_some(updated))
+        })?;
 
+        let continuity = continuity.expect("update_pin always calls decide on success");
         Ok((signed, continuity))
     }
 }
 
 #[async_trait]
 impl<R: ProfileResolver + Send + Sync> ProfileResolver for PinnedResolver<R> {
+    /// Resolve with key continuity enforced; see [`Self::resolve_with_continuity`].
     async fn resolve_alias(&self, alias: &str) -> Result<SignedPaymentProfile> {
         self.resolve_with_continuity(alias)
             .await
@@ -188,6 +210,7 @@ pub struct MemoryKeyStore {
 }
 
 impl MemoryKeyStore {
+    /// An empty in-memory store.
     pub fn new() -> Self {
         Self::default()
     }
@@ -204,54 +227,124 @@ impl TrustedKeyStore for MemoryKeyStore {
         keys.insert(hash_identifier(identifier), key);
         Ok(())
     }
+
+    fn update_pin(
+        &self,
+        identifier: &str,
+        decide: &mut dyn FnMut(Option<&TrustedKey>) -> Result<Option<TrustedKey>>,
+    ) -> Result<()> {
+        let mut keys = self.keys.lock().map_err(lock_poisoned)?;
+        let id = hash_identifier(identifier);
+        if let Some(next) = decide(keys.get(&id))? {
+            keys.insert(id, next);
+        }
+        Ok(())
+    }
 }
 
 /// File-backed pin store at `.satspath/known_keys.json`.
+///
+/// Every read and update re-reads the file, and updates run under an exclusive
+/// OS file lock (`known_keys.json.lock`), so several processes sharing one
+/// `.satspath/` directory never lose or roll back each other's pins.
 pub struct FileKeyStore {
     path: PathBuf,
-    keys: Mutex<HashMap<String, TrustedKey>>,
+    /// Serializes updates within this process; the file lock covers other processes.
+    write_guard: Mutex<()>,
 }
 
 impl FileKeyStore {
     /// Open (or prepare to create) the pin store inside `dir`.
     pub fn open(dir: &Path) -> Result<Self> {
-        let path = dir.join(KNOWN_KEYS_FILE);
-        let keys = if path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(&path)?)?
-        } else {
-            HashMap::new()
+        let store = Self {
+            path: dir.join(KNOWN_KEYS_FILE),
+            write_guard: Mutex::new(()),
         };
-        Ok(Self {
-            path,
-            keys: Mutex::new(keys),
-        })
+        // Fail early on a corrupt pin file rather than on first resolution.
+        store.load()?;
+        Ok(store)
     }
 
+    /// Location of the pin file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read the pin map from disk; a missing file is an empty map.
+    fn load(&self) -> Result<HashMap<String, TrustedKey>> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) => Ok(serde_json::from_str(&raw)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Run `f` on the freshly read pin map while holding the in-process guard and
+    /// the cross-process file lock, then persist the map if `f` changed it.
+    fn transact(
+        &self,
+        f: &mut dyn FnMut(&mut HashMap<String, TrustedKey>) -> Result<bool>,
+    ) -> Result<()> {
+        let _guard = self.write_guard.lock().map_err(lock_poisoned)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.path.with_extension("json.lock"))?;
+        lock_file.lock()?; // released when `lock_file` is dropped
+
+        let mut keys = self.load()?;
+        if f(&mut keys)? {
+            // Write-then-rename so a crash never leaves a truncated pin file; a
+            // unique temp name keeps concurrent writers from sharing one.
+            let tmp = self.path.with_extension(format!(
+                "json.{}.{}.tmp",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::write(&tmp, serde_json::to_string_pretty(&keys)?)?;
+            if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        }
+        Ok(())
     }
 }
 
 impl TrustedKeyStore for FileKeyStore {
     fn trusted_key(&self, identifier: &str) -> Result<Option<TrustedKey>> {
-        let keys = self.keys.lock().map_err(lock_poisoned)?;
-        Ok(keys.get(&hash_identifier(identifier)).cloned())
+        Ok(self.load()?.remove(&hash_identifier(identifier)))
     }
 
     fn pin_key(&self, identifier: &str, key: TrustedKey) -> Result<()> {
-        let mut keys = self.keys.lock().map_err(lock_poisoned)?;
-        keys.insert(hash_identifier(identifier), key);
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Write-then-rename so a crash never leaves a truncated pin file.
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&*keys)?)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        let id = hash_identifier(identifier);
+        self.transact(&mut |keys| {
+            keys.insert(id.clone(), key.clone());
+            Ok(true)
+        })
+    }
+
+    fn update_pin(
+        &self,
+        identifier: &str,
+        decide: &mut dyn FnMut(Option<&TrustedKey>) -> Result<Option<TrustedKey>>,
+    ) -> Result<()> {
+        let id = hash_identifier(identifier);
+        self.transact(&mut |keys| match decide(keys.get(&id))? {
+            Some(next) => {
+                keys.insert(id.clone(), next);
+                Ok(true)
+            }
+            None => Ok(false),
+        })
     }
 }
 
+/// Map a poisoned mutex to a store error instead of panicking.
 fn lock_poisoned<T>(_: std::sync::PoisonError<T>) -> SatsPathError {
     SatsPathError::RegistryError("key pin store lock poisoned".into())
 }
@@ -264,6 +357,7 @@ mod tests {
     use crate::rotation::KeyRotation;
     use secp256k1::SecretKey;
 
+    /// Minimal profile for `alias` under `pubkey` at `sequence`.
     fn profile(alias: &str, pubkey: &str, sequence: u64) -> PaymentProfile {
         PaymentProfile {
             alias: alias.into(),
@@ -288,11 +382,13 @@ mod tests {
         }
     }
 
+    /// Fresh identity keypair as (pubkey hex, secret).
     fn keypair() -> (String, SecretKey) {
         let kp = generate_identity_keypair();
         (hex::encode(kp.public_key.serialize()), kp.secret_key)
     }
 
+    /// A pin for `pubkey` at `sequence` with zeroed timestamps.
     fn pin(pubkey: &str, sequence: u64) -> TrustedKey {
         TrustedKey {
             identity_pubkey: pubkey.into(),
@@ -304,6 +400,7 @@ mod tests {
 
     const ALICE: &str = "alice@example.com";
 
+    /// First resolution pins the key; the same key then matches.
     #[test]
     fn first_use_and_match() {
         let (pk, sk) = keypair();
@@ -318,6 +415,7 @@ mod tests {
         );
     }
 
+    /// A different key without a rotation is rejected.
     #[test]
     fn substituted_key_rejected() {
         let (alice_pk, _) = keypair();
@@ -329,6 +427,7 @@ mod tests {
         ));
     }
 
+    /// An older sequence under the pinned key is rejected as a replay.
     #[test]
     fn stale_sequence_rejected() {
         let (pk, sk) = keypair();
@@ -336,6 +435,7 @@ mod tests {
         assert!(check_key_continuity(ALICE, Some(&pin(&pk, 5)), &old).is_err());
     }
 
+    /// A profile rotated from `old` to a new key, signed as the protocol requires.
     fn rotated(
         old: (&str, &SecretKey),
         new: (&str, &SecretKey),
@@ -357,6 +457,7 @@ mod tests {
         sign_profile(p, new.1).unwrap()
     }
 
+    /// A rotation authorized by the pinned key is followed.
     #[test]
     fn authorized_rotation_accepted() {
         let (old_pk, old_sk) = keypair();
@@ -370,6 +471,7 @@ mod tests {
         );
     }
 
+    /// A rotation signed by some other key is rejected.
     #[test]
     fn rotation_not_from_pinned_key_rejected() {
         let (alice_pk, _) = keypair();
@@ -393,6 +495,43 @@ mod tests {
         assert!(check_key_continuity(ALICE, Some(&pin(&alice_pk, 1)), &forged).is_err());
     }
 
+    /// Two stores on one directory stand in for two processes: interleaved pins
+    /// must all survive, where a cached full-map write would drop the other's.
+    #[test]
+    fn file_store_keeps_concurrent_writers_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(FileKeyStore::open(dir.path()).unwrap());
+        let b = Arc::new(FileKeyStore::open(dir.path()).unwrap());
+        let handles: Vec<_> = [(a, "a"), (b, "b")]
+            .into_iter()
+            .map(|(store, prefix)| {
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        store
+                            .pin_key(&format!("{prefix}{i}@example.com"), pin("02aa", i))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = FileKeyStore::open(dir.path()).unwrap();
+        for prefix in ["a", "b"] {
+            for i in 0..25 {
+                assert_eq!(
+                    store
+                        .trusted_key(&format!("{prefix}{i}@example.com"))
+                        .unwrap(),
+                    Some(pin("02aa", i)),
+                    "{prefix}{i} lost"
+                );
+            }
+        }
+    }
+
+    /// Pins persist across reopen and the raw identifier is never written.
     #[test]
     fn file_store_round_trip() {
         let dir = tempfile::tempdir().unwrap();

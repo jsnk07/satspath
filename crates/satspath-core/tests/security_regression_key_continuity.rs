@@ -25,11 +25,13 @@ use satspath_core::{Result, SatsPathError, SignedPaymentProfile};
 
 const ALICE: &str = "alice@example.com";
 
+/// Fresh identity keypair as (pubkey hex, secret).
 fn keypair() -> (String, SecretKey) {
     let kp = generate_identity_keypair();
     (hex::encode(kp.public_key.serialize()), kp.secret_key)
 }
 
+/// Profile for the test alias under `pubkey` with one Lightning method.
 fn profile(pubkey: &str, lightning_address: &str, sequence: u64) -> PaymentProfile {
     PaymentProfile {
         alias: ALICE.into(),
@@ -59,11 +61,13 @@ struct FixedResolver(SignedPaymentProfile);
 
 #[async_trait]
 impl ProfileResolver for FixedResolver {
+    /// Return whatever profile the test currently serves.
     async fn resolve_alias(&self, _alias: &str) -> Result<SignedPaymentProfile> {
         Ok(self.0.clone())
     }
 }
 
+/// A pinning resolver over the switchable test transport.
 fn wallet_resolver(
     answer: SignedPaymentProfile,
     store: &Arc<MemoryKeyStore>,
@@ -74,6 +78,7 @@ fn wallet_resolver(
     )
 }
 
+/// A substituted key after first use must be refused.
 #[tokio::test]
 async fn resolution_result_must_be_bound_to_trusted_key() {
     let store = Arc::new(MemoryKeyStore::new());
@@ -109,6 +114,7 @@ async fn resolution_result_must_be_bound_to_trusted_key() {
     }
 }
 
+/// A rotation signed by the trusted key is accepted and re-pinned.
 #[tokio::test]
 async fn authorized_rotation_is_followed() {
     let store = Arc::new(MemoryKeyStore::new());
@@ -160,6 +166,7 @@ async fn authorized_rotation_is_followed() {
     ));
 }
 
+/// Replaying an older profile under the trusted key is refused.
 #[tokio::test]
 async fn replayed_older_profile_is_rejected() {
     let store = Arc::new(MemoryKeyStore::new());

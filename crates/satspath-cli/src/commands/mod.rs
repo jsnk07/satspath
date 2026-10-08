@@ -44,10 +44,12 @@ use anyhow::Result;
 use satspath_core::registry::Registry;
 use std::path::PathBuf;
 
+/// The CLI's local state directory (`.satspath/`).
 pub(crate) fn satspath_dir() -> PathBuf {
     PathBuf::from(".satspath")
 }
 
+/// Open the local profile registry inside [`satspath_dir`].
 pub(crate) fn open_registry() -> Result<Registry> {
     let dir = satspath_dir();
     if !dir.exists() {
@@ -80,6 +82,7 @@ pub(crate) fn get_resolver() -> Result<PinnedResolver<ChainResolver>> {
     Ok(PinnedResolver::new(build_chain(), store))
 }
 
+/// The resolver chain used by CLI commands, before key pinning is applied.
 fn build_chain() -> ChainResolver {
     let mut chain = ChainResolver::new();
 
