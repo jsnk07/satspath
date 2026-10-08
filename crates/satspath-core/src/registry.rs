@@ -185,10 +185,7 @@ impl Registry {
             .ok_or_else(|| SatsPathError::AliasNotFound(canonical.clone()))?;
 
         if profile.profile.revoked {
-            return Err(SatsPathError::RegistryError(format!(
-                "Alias {} has been revoked",
-                canonical
-            )));
+            return Err(SatsPathError::ProfileRevoked(canonical));
         }
 
         Ok(profile)

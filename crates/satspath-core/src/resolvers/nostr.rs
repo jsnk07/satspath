@@ -224,9 +224,8 @@ impl ProfileResolver for NostrResolver {
         match best_profile {
             Some(profile) => {
                 if profile.profile.revoked {
-                    Err(SatsPathError::RegistryError(format!(
-                        "Alias {} has been revoked",
-                        alias
+                    Err(SatsPathError::ProfileRevoked(canonicalize_identifier(
+                        alias,
                     )))
                 } else {
                     Ok(profile)

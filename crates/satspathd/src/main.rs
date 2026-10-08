@@ -213,6 +213,57 @@ mod tests {
         assert!(!raw.contains("secret_key"));
     }
 
+    /// A revoked recipient gets NoRoute from /v1/send and no invite is stored.
+    #[tokio::test]
+    async fn send_to_revoked_recipient_is_no_route_not_invite() {
+        use satspath_core::registry::Registry;
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_identity_keypair();
+        let profile = PaymentProfile {
+            alias: "alice@example.com".into(),
+            identity_pubkey: hex::encode(key.public_key.serialize()),
+            methods: vec![PaymentMethod::Lightning {
+                label: "LN".into(),
+                lightning_address: Some("alice@example.com".into()),
+                lnurl: None,
+                bolt12: None,
+                receiver_pubkey: None,
+            }],
+            updated_at: now(),
+            expires_at: None,
+            sequence: Some(0),
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: vec![],
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: true,
+        };
+        Registry::open(dir.path())
+            .unwrap()
+            .register_profile(sign_profile(profile, &key.secret_key).unwrap())
+            .unwrap();
+        let response = send_response(
+            &test_state(dir.path()),
+            SendRequest {
+                recipient: "alice@example.com".into(),
+                amount_sats: 1_000,
+                routing_ok: Some(true),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, SendResponse::NoRoute { ref reason } if reason.contains("revoked")),
+            "{response:?}"
+        );
+        let mut invites = satspath_core::InviteStore::open(dir.path()).unwrap();
+        assert!(
+            invites.list().unwrap().is_empty(),
+            "no invite may be created"
+        );
+    }
+
     #[tokio::test]
     async fn quote_rejects_profile_without_transparency() {
         use satspath_core::registry::Registry;
