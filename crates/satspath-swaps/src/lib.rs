@@ -19,6 +19,7 @@ pub use swap_manager::SwapManager;
 pub use swap_store::SwapStore;
 pub use tx_builder::{
     build_reverse_claim_tx, build_submarine_refund_tx, claim_params_from_record,
-    refund_params_from_record, BuiltSwapTx, ReverseClaimTxParams, SubmarineRefundTxParams,
+    finalize_reverse_claim, finalize_submarine_refund, refund_params_from_record,
+    ReverseClaimTxParams, SubmarineRefundTxParams, UnsignedSwapTx,
 };
 pub use types::{PairFees, PairLimits, SwapKind, SwapResult, SwapStatus};

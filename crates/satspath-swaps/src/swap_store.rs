@@ -145,12 +145,12 @@ impl SwapStore {
 
     // ── Sensitive material guard ──────────────────────────────────────────────
 
-    /// Returns true if the record contains cryptographic secrets that must not
-    /// be stored in plaintext: preimage, refund key, or claim key.
+    /// Returns true if the record contains secrets that must not be stored in
+    /// plaintext: the preimage, or a legacy refund/claim key.
     pub fn contains_sensitive_material(record: &SwapRecord) -> bool {
         record.preimage_hex.is_some()
-            || record.refund_key_hex.is_some()
-            || record.claim_key_hex.is_some()
+            || record.legacy_refund_key_hex.is_some()
+            || record.legacy_claim_key_hex.is_some()
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -302,8 +302,10 @@ mod tests {
             amount_sats: 10_000,
             preimage_hex: None,
             preimage_hash_hex: None,
-            refund_key_hex: None,
-            claim_key_hex: None,
+            refund_pubkey_hex: None,
+            claim_pubkey_hex: None,
+            legacy_refund_key_hex: None,
+            legacy_claim_key_hex: None,
             invoice: Some("lnbc10u1...".into()),
             lockup_address: Some("bc1q...".into()),
             expected_amount_sats: Some(10_100),
@@ -447,12 +449,12 @@ mod tests {
 
         // Record with refund_key_hex must be rejected without encryption key.
         let mut with_refund = make_record("swap_refund");
-        with_refund.refund_key_hex = Some("cafebabe".repeat(8));
+        with_refund.legacy_refund_key_hex = Some("cafebabe".repeat(8));
         assert!(store.upsert(&with_refund).is_err());
 
         // Record with claim_key_hex must be rejected without encryption key.
         let mut with_claim = make_record("swap_claim");
-        with_claim.claim_key_hex = Some("aabbccdd".repeat(8));
+        with_claim.legacy_claim_key_hex = Some("aabbccdd".repeat(8));
         assert!(store.upsert(&with_claim).is_err());
 
         // Same record with an encryption key must succeed.
@@ -476,11 +478,11 @@ mod tests {
         assert!(SwapStore::contains_sensitive_material(&with_pre));
 
         let mut with_refund = make_record("x");
-        with_refund.refund_key_hex = Some("bbb".into());
+        with_refund.legacy_refund_key_hex = Some("bbb".into());
         assert!(SwapStore::contains_sensitive_material(&with_refund));
 
         let mut with_claim = make_record("x");
-        with_claim.claim_key_hex = Some("ccc".into());
+        with_claim.legacy_claim_key_hex = Some("ccc".into());
         assert!(SwapStore::contains_sensitive_material(&with_claim));
     }
 }

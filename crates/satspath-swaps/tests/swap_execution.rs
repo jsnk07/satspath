@@ -1,4 +1,5 @@
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::{Message, Secp256k1};
+use bitcoin::{Address, Network, ScriptBuf};
 use chrono::Utc;
 
 use satspath_core::execution::{ExecutionGatePolicy, MockWalletExecutor, WalletExecutor};
@@ -8,68 +9,83 @@ use satspath_swaps::execution_gate::{
 };
 use satspath_swaps::tx_builder::{
     build_reverse_claim_tx, build_submarine_refund_tx, claim_params_from_record,
-    refund_params_from_record,
+    finalize_reverse_claim, finalize_submarine_refund, refund_params_from_record,
 };
 use satspath_swaps::types::{SwapKind, SwapRecord, SwapStatus};
 
-#[test]
-fn test_reverse_swap_claim_tx_from_record() {
-    let secp = Secp256k1::new();
-    let (claim_sk, _) = secp.generate_keypair(&mut rand::thread_rng());
-    let claim_key_hex = hex::encode(claim_sk.secret_bytes());
+fn p2wsh_address(script_bytes: &[u8]) -> String {
+    Address::p2wsh(
+        &ScriptBuf::from_bytes(script_bytes.to_vec()),
+        Network::Testnet,
+    )
+    .to_string()
+}
 
-    let preimage = [42u8; 32];
-    let preimage_hex = hex::encode(preimage);
-
-    let script_bytes = vec![0x63, 0x52, 0x67, 0x00, 0x68];
-    let script_hex = hex::encode(&script_bytes);
-
-    let record = SwapRecord {
-        id: "test-reverse-swap-1".into(),
-        kind: SwapKind::Reverse,
-        status: SwapStatus::TransactionConfirmed,
+fn record(kind: SwapKind, status: SwapStatus) -> SwapRecord {
+    SwapRecord {
+        id: format!("test-{kind:?}"),
+        kind,
+        status,
         created_at: Utc::now().timestamp(),
         updated_at: Utc::now().timestamp(),
         amount_sats: 50_000,
-        preimage_hex: Some(preimage_hex.clone()),
-        preimage_hash_hex: Some(
-            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
-        ),
-        lockup_address: Some("tb1qmocklockupaddressforreverseswap".into()),
-        claim_key_hex: Some(claim_key_hex),
-        refund_key_hex: None,
-        invoice: Some("lnbcrt500u1mock".into()),
-        expected_amount_sats: Some(50_000),
+        preimage_hex: None,
+        preimage_hash_hex: None,
+        lockup_address: None,
+        refund_pubkey_hex: None,
+        claim_pubkey_hex: None,
+        legacy_refund_key_hex: None,
+        legacy_claim_key_hex: None,
+        invoice: None,
+        expected_amount_sats: None,
         timeout_block_height: None,
         boltz_claim_pubkey: None,
-        redeem_script: Some(script_hex),
-        lockup_txid: Some(
-            "1111111111111111111111111111111111111111111111111111111111111111".into(),
-        ),
+        redeem_script: None,
+        lockup_txid: None,
         settlement_txid: None,
         destination_address: None,
-    };
+    }
+}
+
+/// Plays the host wallet: signs the PSBT sighash. SatsPath never holds this key.
+fn host_wallet_sign(sighash_hex: &str, secret: &bitcoin::secp256k1::SecretKey) -> Vec<u8> {
+    let digest: [u8; 32] = hex::decode(sighash_hex).unwrap().try_into().unwrap();
+    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), secret);
+    let mut out = sig.serialize_der().to_vec();
+    out.push(0x01); // SIGHASH_ALL
+    out
+}
+
+#[test]
+fn test_reverse_swap_claim_tx_from_record() {
+    let preimage = [42u8; 32];
+    let script_bytes = vec![0x63, 0x52, 0x67, 0x00, 0x68];
+
+    let mut rec = record(SwapKind::Reverse, SwapStatus::TransactionConfirmed);
+    rec.preimage_hex = Some(hex::encode(preimage));
+    rec.lockup_address = Some(p2wsh_address(&script_bytes));
+    rec.expected_amount_sats = Some(50_000);
+    rec.redeem_script = Some(hex::encode(&script_bytes));
 
     let dest_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     let lockup_txid = "1111111111111111111111111111111111111111111111111111111111111111";
-    let params = claim_params_from_record(&record, lockup_txid, 0, dest_addr)
-        .expect("claim params extraction");
-
-    assert_eq!(params.swap_id, "test-reverse-swap-1");
+    let params =
+        claim_params_from_record(&rec, lockup_txid, 0, dest_addr).expect("claim params extraction");
     assert_eq!(params.destination_address, dest_addr);
     assert_eq!(params.lockup_amount_sats, 50_000);
     assert_eq!(params.miner_fee_sats, 1000);
 
-    let built = build_reverse_claim_tx(params).expect("claim tx building");
+    let unsigned = build_reverse_claim_tx(params).expect("claim tx building");
+    assert_eq!(unsigned.output_amount_sats, 49_000);
+    assert!(!unsigned.psbt_base64.is_empty());
+    assert!(unsigned.psbt.unsigned_tx.input[0].witness.is_empty());
 
-    assert_eq!(built.transaction.input.len(), 1);
-    assert_eq!(built.transaction.output.len(), 1);
-    assert_eq!(built.transaction.output[0].value.to_sat(), 49_000);
-    assert_eq!(built.output_amount_sats, 49_000);
-    assert_eq!(built.fee_sats, 1000);
+    let (wallet_key, _) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
+    let sig = host_wallet_sign(&unsigned.sighash_hex, &wallet_key);
+    let tx = finalize_reverse_claim(&unsigned, &sig, &hex::encode(preimage)).expect("finalize");
 
-    // Verify witness structure: [signature, preimage, redeem_script]
-    let witness = &built.transaction.input[0].witness;
+    // Witness structure: [signature, preimage, redeem_script]
+    let witness = &tx.input[0].witness;
     assert_eq!(witness.len(), 3);
     assert_eq!(witness.last().unwrap(), &script_bytes[..]);
     assert_eq!(witness.iter().nth(1).unwrap(), &preimage[..]);
@@ -77,60 +93,51 @@ fn test_reverse_swap_claim_tx_from_record() {
 
 #[test]
 fn test_submarine_swap_refund_tx_from_record() {
-    let secp = Secp256k1::new();
-    let (refund_sk, _) = secp.generate_keypair(&mut rand::thread_rng());
-    let refund_key_hex = hex::encode(refund_sk.secret_bytes());
-
     let script_bytes = vec![0x63, 0x52, 0x67, 0x01, 0x68];
-    let script_hex = hex::encode(&script_bytes);
 
-    let record = SwapRecord {
-        id: "test-submarine-swap-1".into(),
-        kind: SwapKind::Submarine,
-        status: SwapStatus::InvoiceFailedToPay,
-        created_at: Utc::now().timestamp(),
-        updated_at: Utc::now().timestamp(),
-        amount_sats: 100_000,
-        preimage_hex: None,
-        preimage_hash_hex: Some(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-        ),
-        lockup_address: Some("tb1qmocklockupaddressforsubmarineswap".into()),
-        claim_key_hex: None,
-        refund_key_hex: Some(refund_key_hex),
-        invoice: Some("lnbcrt1m1mock".into()),
-        expected_amount_sats: Some(100_000),
-        timeout_block_height: Some(800_000),
-        boltz_claim_pubkey: None,
-        redeem_script: Some(script_hex),
-        lockup_txid: Some(
-            "2222222222222222222222222222222222222222222222222222222222222222".into(),
-        ),
-        settlement_txid: None,
-        destination_address: None,
-    };
+    let mut rec = record(SwapKind::Submarine, SwapStatus::InvoiceFailedToPay);
+    rec.amount_sats = 100_000;
+    rec.lockup_address = Some(p2wsh_address(&script_bytes));
+    rec.expected_amount_sats = Some(100_000);
+    rec.timeout_block_height = Some(800_000);
+    rec.redeem_script = Some(hex::encode(&script_bytes));
 
     let refund_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     let lockup_txid = "2222222222222222222222222222222222222222222222222222222222222222";
-    let params = refund_params_from_record(&record, lockup_txid, 1, refund_addr)
+    let params = refund_params_from_record(&rec, lockup_txid, 1, refund_addr)
         .expect("refund params extraction");
-
-    assert_eq!(params.swap_id, "test-submarine-swap-1");
-    assert_eq!(params.destination_address, refund_addr);
     assert_eq!(params.lockup_amount_sats, 100_000);
     assert_eq!(params.timeout_block_height, 800_000);
 
-    let built = build_submarine_refund_tx(params).expect("refund tx building");
+    let unsigned = build_submarine_refund_tx(params).expect("refund tx building");
+    assert_eq!(unsigned.output_amount_sats, 99_000);
+    assert_eq!(
+        unsigned.psbt.unsigned_tx.lock_time.to_consensus_u32(),
+        800_000
+    );
 
-    assert_eq!(built.transaction.input.len(), 1);
-    assert_eq!(built.transaction.output.len(), 1);
-    assert_eq!(built.transaction.output[0].value.to_sat(), 99_000);
-    assert_eq!(built.transaction.lock_time.to_consensus_u32(), 800_000);
+    let (wallet_key, _) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
+    let sig = host_wallet_sign(&unsigned.sighash_hex, &wallet_key);
+    let tx = finalize_submarine_refund(&unsigned, &sig).expect("finalize");
 
-    // Verify witness structure: [signature, 0, redeem_script]
-    let witness = &built.transaction.input[0].witness;
+    // Witness structure: [signature, 0, redeem_script]
+    let witness = &tx.input[0].witness;
     assert_eq!(witness.len(), 3);
     assert_eq!(witness.last().unwrap(), &script_bytes[..]);
+}
+
+#[test]
+fn record_without_lockup_address_cannot_build_claim() {
+    let mut rec = record(SwapKind::Reverse, SwapStatus::TransactionConfirmed);
+    rec.preimage_hex = Some(hex::encode([1u8; 32]));
+    let err = claim_params_from_record(
+        &rec,
+        &"11".repeat(32),
+        0,
+        "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("lockup address"));
 }
 
 #[tokio::test]
@@ -205,8 +212,9 @@ async fn swap_creation_fails_closed_before_contacting_boltz() {
     // Nothing listens here: reaching the network would surface a connection error
     // instead of the execution-gate error asserted below.
     let client = BoltzClient::new("http://127.0.0.1:9/v2", "ws://127.0.0.1:9/v2/ws");
-    let dir = std::env::temp_dir().join(format!("satspath-gate-{}", std::process::id()));
-    let store = SwapStore::open_plaintext_for_tests(dir.join("swaps.json"));
+    let dir = tempfile::tempdir().unwrap();
+    let store = SwapStore::open_plaintext_for_tests(dir.path().join("swaps.json"));
+    let pubkey = "02".to_string() + &"11".repeat(32);
     let dest = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string();
 
     let errs = [
@@ -216,6 +224,7 @@ async fn swap_creation_fails_closed_before_contacting_boltz() {
             SubmarineParams {
                 invoice: "lntb1mock".into(),
                 amount_sats: 50_000,
+                refund_pubkey_hex: pubkey.clone(),
             },
         )
         .await
@@ -227,6 +236,7 @@ async fn swap_creation_fails_closed_before_contacting_boltz() {
             ReverseParams {
                 receive_amount_sats: 50_000,
                 destination_address: dest.clone(),
+                claim_pubkey_hex: pubkey.clone(),
             },
         )
         .await
@@ -239,6 +249,8 @@ async fn swap_creation_fails_closed_before_contacting_boltz() {
                 send_amount_sats: 50_000,
                 destination_address: dest,
                 sender_pays_fees: false,
+                claim_pubkey_hex: pubkey.clone(),
+                refund_pubkey_hex: pubkey.clone(),
             },
         )
         .await
@@ -254,30 +266,33 @@ async fn swap_creation_fails_closed_before_contacting_boltz() {
 
 #[test]
 fn confirmed_reverse_swap_is_recoverable() {
-    let mut record = SwapRecord {
-        id: "rev-confirmed".into(),
-        kind: SwapKind::Reverse,
-        status: SwapStatus::TransactionConfirmed,
-        created_at: Utc::now().timestamp(),
-        updated_at: Utc::now().timestamp(),
-        amount_sats: 50_000,
-        preimage_hex: None,
-        preimage_hash_hex: None,
-        lockup_address: None,
-        claim_key_hex: None,
-        refund_key_hex: None,
-        invoice: None,
-        expected_amount_sats: None,
-        timeout_block_height: None,
-        boltz_claim_pubkey: None,
-        redeem_script: None,
-        lockup_txid: None,
-        settlement_txid: None,
-        destination_address: None,
-    };
-    assert!(record.is_recoverable());
+    let mut rec = record(SwapKind::Reverse, SwapStatus::TransactionConfirmed);
+    assert!(rec.is_recoverable());
 
     // A confirmed submarine lockup is Boltz's to claim, not ours to recover.
-    record.kind = SwapKind::Submarine;
-    assert!(!record.is_recoverable());
+    rec.kind = SwapKind::Submarine;
+    assert!(!rec.is_recoverable());
+}
+
+#[test]
+fn legacy_secret_keys_survive_a_store_rewrite() {
+    // Records written before swap keys moved to the host wallet still carry the
+    // secret keys; dropping them on rewrite would strand an in-flight swap.
+    let json = r#"{"id":"old","kind":"reverse","status":"transaction.confirmed","amount_sats":1,
+        "claim_key_hex":"aa","refund_key_hex":"bb","created_at":0,"updated_at":0}"#;
+    let rec: SwapRecord = serde_json::from_str(json).expect("legacy record parses");
+    assert_eq!(rec.legacy_claim_key_hex.as_deref(), Some("aa"));
+    assert_eq!(rec.legacy_refund_key_hex.as_deref(), Some("bb"));
+    let out = serde_json::to_string(&rec).unwrap();
+    assert!(out.contains(r#""claim_key_hex":"aa""#) && out.contains(r#""refund_key_hex":"bb""#));
+}
+
+#[test]
+fn swap_pubkeys_are_validated() {
+    use satspath_swaps::types::parse_swap_pubkey;
+    let valid = "02".to_string()
+        + &"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"[..64];
+    assert_eq!(parse_swap_pubkey(&valid, "claim").unwrap(), valid);
+    assert!(parse_swap_pubkey("not-a-key", "claim").is_err());
+    assert!(parse_swap_pubkey(&"00".repeat(33), "refund").is_err());
 }

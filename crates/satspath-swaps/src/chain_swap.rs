@@ -1,12 +1,11 @@
 use rand::RngCore;
-use secp256k1::{Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::boltz_client::{BoltzClient, ChainSwapRequest};
 use crate::errors::{Result, SwapError};
 use crate::swap_store::SwapStore;
-use crate::types::{SwapKind, SwapRecord, SwapResult, SwapStatus};
+use crate::types::{parse_swap_pubkey, SwapKind, SwapRecord, SwapResult, SwapStatus};
 
 /// Parameters for creating a chain swap.
 ///
@@ -25,6 +24,12 @@ pub struct ChainSwapParams {
     /// If false, set `send_amount_sats` to the desired *received* amount;
     /// the SDK will calculate the required send amount including fees.
     pub sender_pays_fees: bool,
+    /// Host-wallet public key (compressed, hex) that claims Boltz's lockup.
+    /// SatsPath never sees the matching secret key.
+    pub claim_pubkey_hex: String,
+    /// Host-wallet public key (compressed, hex) that refunds the sender's lockup.
+    /// SatsPath never sees the matching secret key.
+    pub refund_pubkey_hex: String,
 }
 
 /// Output of a created chain swap (what the user needs to act on).
@@ -83,18 +88,9 @@ pub async fn create_chain_swap(
     rand::thread_rng().fill_bytes(&mut preimage);
     let preimage_hash: [u8; 32] = Sha256::digest(preimage).into();
 
-    let secp = Secp256k1::new();
-    let mut rng = rand::thread_rng();
-
-    // Claim keypair: used to claim Boltz's server-side lockup
-    let claim_secret = SecretKey::new(&mut rng);
-    let claim_pubkey_hex = hex::encode(claim_secret.public_key(&secp).serialize());
-    let claim_key_hex = hex::encode(claim_secret.secret_bytes());
-
-    // Refund keypair: used to recover funds if swap fails
-    let refund_secret = SecretKey::new(&mut rng);
-    let refund_pubkey_hex = hex::encode(refund_secret.public_key(&secp).serialize());
-    let refund_key_hex = hex::encode(refund_secret.secret_bytes());
+    // Claim and refund keys belong to the host wallet; SatsPath only relays pubkeys.
+    let claim_pubkey_hex = parse_swap_pubkey(&params.claim_pubkey_hex, "claim")?;
+    let refund_pubkey_hex = parse_swap_pubkey(&params.refund_pubkey_hex, "refund")?;
 
     // Determine fee directive
     let (user_lock, server_lock) = if params.sender_pays_fees {
@@ -107,8 +103,8 @@ pub async fn create_chain_swap(
         from: "BTC".into(),
         to: "BTC".into(),
         preimage_hash: hex::encode(preimage_hash),
-        claim_public_key: claim_pubkey_hex,
-        refund_public_key: refund_pubkey_hex,
+        claim_public_key: claim_pubkey_hex.clone(),
+        refund_public_key: refund_pubkey_hex.clone(),
         user_lock_amount: user_lock,
         server_lock_amount: server_lock,
     };
@@ -123,8 +119,10 @@ pub async fn create_chain_swap(
         amount_sats: params.send_amount_sats,
         preimage_hex: Some(hex::encode(preimage)),
         preimage_hash_hex: Some(hex::encode(preimage_hash)),
-        refund_key_hex: Some(refund_key_hex),
-        claim_key_hex: Some(claim_key_hex),
+        refund_pubkey_hex: Some(refund_pubkey_hex),
+        claim_pubkey_hex: Some(claim_pubkey_hex),
+        legacy_refund_key_hex: None,
+        legacy_claim_key_hex: None,
         invoice: None,
         lockup_address: Some(resp.lockup_details.lockup_address.clone()),
         expected_amount_sats: Some(resp.lockup_details.amount),
@@ -239,7 +237,7 @@ pub async fn wait_and_claim_chain(
 ///
 /// In the cooperative path (Taproot key-path spend):
 ///   1. Client requests Boltz's partial Schnorr signature
-///   2. Combines with client's claim_key signature
+///   2. Combines it with the host wallet's claim-key signature
 ///   3. Result: indistinguishable from any standard P2TR payment
 ///
 /// This is the privacy-optimal path — the HTLC contract is never revealed.
@@ -251,11 +249,6 @@ fn build_cooperative_claim(record: &SwapRecord) -> Result<String> {
         .as_deref()
         .ok_or_else(|| SwapError::Key("Preimage missing from chain swap record".into()))?;
 
-    let _claim_key_hex = record
-        .claim_key_hex
-        .as_deref()
-        .ok_or_else(|| SwapError::Key("Claim key missing from chain swap record".into()))?;
-
     let _destination = record
         .destination_address
         .as_deref()
@@ -266,11 +259,11 @@ fn build_cooperative_claim(record: &SwapRecord) -> Result<String> {
     //   2. Fetch server lockup UTXO
     //   3. Build unsigned claim tx (server lockup → destination)
     //   4. Compute BIP341 sighash
-    //   5. Create claim_key signature
+    //   5. Have the host wallet sign with its claim key
     //   6. Aggregate with Boltz partial sig (MuSig2)
     //   7. Broadcast via Bitcoin node RPC
 
     Err(SwapError::Key(
-        "Cooperative Taproot claim not yet implemented — secrets preserved for recovery".into(),
+        "Cooperative Taproot claim not yet implemented — preimage preserved for recovery".into(),
     ))
 }

@@ -1,10 +1,9 @@
-use secp256k1::{Secp256k1, SecretKey};
 use std::time::Duration;
 
 use crate::boltz_client::{BoltzClient, SubmarineSwapRequest};
 use crate::errors::{Result, SwapError};
 use crate::swap_store::SwapStore;
-use crate::types::{SwapKind, SwapRecord, SwapResult, SwapStatus};
+use crate::types::{parse_swap_pubkey, SwapKind, SwapRecord, SwapResult, SwapStatus};
 
 /// Parameters for creating a submarine swap.
 ///
@@ -15,6 +14,9 @@ pub struct SubmarineParams {
     pub invoice: String,
     /// Amount in satoshis to send. Used to verify against Boltz limits.
     pub amount_sats: u64,
+    /// Host-wallet public key (compressed, hex) that can refund the lockup.
+    /// SatsPath never sees the matching secret key.
+    pub refund_pubkey_hex: String,
 }
 
 /// Output of a created submarine swap (what the user needs to act on).
@@ -60,13 +62,8 @@ pub async fn create_submarine(
         });
     }
 
-    // Generate ephemeral refund keypair (client-side; never transmitted to Boltz)
-    let secp = Secp256k1::new();
-    let mut rng = rand::thread_rng();
-    let refund_secret = SecretKey::new(&mut rng);
-    let refund_pubkey = refund_secret.public_key(&secp);
-    let refund_pubkey_hex = hex::encode(refund_pubkey.serialize());
-    let refund_key_hex = hex::encode(refund_secret.secret_bytes());
+    // The refund key belongs to the host wallet; SatsPath only relays its pubkey.
+    let refund_pubkey_hex = parse_swap_pubkey(&params.refund_pubkey_hex, "refund")?;
 
     // Call Boltz API
     let req = SubmarineSwapRequest {
@@ -87,8 +84,10 @@ pub async fn create_submarine(
         amount_sats: params.amount_sats,
         preimage_hex: None,
         preimage_hash_hex: None,
-        refund_key_hex: Some(refund_key_hex),
-        claim_key_hex: None,
+        refund_pubkey_hex: Some(refund_pubkey_hex),
+        claim_pubkey_hex: None,
+        legacy_refund_key_hex: None,
+        legacy_claim_key_hex: None,
         invoice: Some(params.invoice),
         lockup_address: Some(resp.address.clone()),
         expected_amount_sats: Some(resp.expected_amount),
@@ -175,25 +174,21 @@ pub async fn wait_submarine(
 
 /// Attempt to broadcast a refund transaction for a failed submarine swap.
 ///
-/// Returns the refund TXID on success. Not implemented yet: `tx_builder` only signs
-/// P2WSH HTLCs, which cannot spend Boltz v2 Taproot lockups, and nothing broadcasts,
-/// so this fails closed instead of reporting a refund that never reached the chain.
+/// Returns the refund TXID on success. Not implemented yet: `tx_builder` only builds
+/// P2WSH HTLC refunds, which cannot spend Boltz v2 Taproot lockups, and nothing
+/// broadcasts, so this fails closed instead of reporting a refund that never reached
+/// the chain. The refund key stays with the host wallet.
 async fn attempt_submarine_refund(
     _client: &BoltzClient,
     store: &SwapStore,
     swap_id: &str,
 ) -> Result<String> {
-    let record = store
+    store
         .get(swap_id)?
         .ok_or_else(|| SwapError::NotFound(swap_id.to_string()))?;
 
-    record
-        .lockup_txid
-        .as_deref()
-        .ok_or_else(|| SwapError::Key("Lockup txid missing from swap record".into()))?;
-
     Err(SwapError::Key(
-        "Taproot refund broadcast not yet implemented — refund key preserved for recovery".into(),
+        "Taproot refund broadcast not yet implemented — swap record preserved for recovery".into(),
     ))
 }
 

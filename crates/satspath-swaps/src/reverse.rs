@@ -1,12 +1,11 @@
 use rand::RngCore;
-use secp256k1::{Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::boltz_client::{BoltzClient, ReverseSwapRequest};
 use crate::errors::{Result, SwapError};
 use crate::swap_store::SwapStore;
-use crate::types::{SwapKind, SwapRecord, SwapResult, SwapStatus};
+use crate::types::{parse_swap_pubkey, SwapKind, SwapRecord, SwapResult, SwapStatus};
 
 /// Parameters for creating a reverse swap.
 ///
@@ -18,6 +17,9 @@ pub struct ReverseParams {
     pub receive_amount_sats: u64,
     /// Bitcoin address where the claimed BTC should land.
     pub destination_address: String,
+    /// Host-wallet public key (compressed, hex) that can claim the lockup.
+    /// SatsPath never sees the matching secret key.
+    pub claim_pubkey_hex: String,
 }
 
 /// Output of a created reverse swap (what the user needs to act on).
@@ -74,13 +76,8 @@ pub async fn create_reverse(
     rand::thread_rng().fill_bytes(&mut preimage);
     let preimage_hash: [u8; 32] = Sha256::digest(preimage).into();
 
-    // Generate ephemeral claim keypair
-    let secp = Secp256k1::new();
-    let mut rng = rand::thread_rng();
-    let claim_secret = SecretKey::new(&mut rng);
-    let claim_pubkey = claim_secret.public_key(&secp);
-    let claim_pubkey_hex = hex::encode(claim_pubkey.serialize());
-    let claim_key_hex = hex::encode(claim_secret.secret_bytes());
+    // The claim key belongs to the host wallet; SatsPath only relays its pubkey.
+    let claim_pubkey_hex = parse_swap_pubkey(&params.claim_pubkey_hex, "claim")?;
 
     // Call Boltz API
     let req = ReverseSwapRequest {
@@ -88,7 +85,7 @@ pub async fn create_reverse(
         to: "BTC".into(),
         invoice_amount: params.receive_amount_sats,
         preimage_hash: hex::encode(preimage_hash),
-        claim_public_key: claim_pubkey_hex,
+        claim_public_key: claim_pubkey_hex.clone(),
     };
     let resp = client.create_reverse(&req).await?;
 
@@ -102,8 +99,10 @@ pub async fn create_reverse(
         amount_sats: params.receive_amount_sats,
         preimage_hex: Some(hex::encode(preimage)),
         preimage_hash_hex: Some(hex::encode(preimage_hash)),
-        refund_key_hex: None,
-        claim_key_hex: Some(claim_key_hex),
+        refund_pubkey_hex: None,
+        claim_pubkey_hex: Some(claim_pubkey_hex),
+        legacy_refund_key_hex: None,
+        legacy_claim_key_hex: None,
         invoice: Some(resp.invoice.clone()),
         lockup_address: Some(resp.lockup_address.clone()),
         expected_amount_sats: Some(params.receive_amount_sats),
@@ -204,7 +203,7 @@ pub async fn wait_and_claim_reverse(
 ///
 /// # Current Status
 /// The claim transaction for Taproot (Boltz v2 default) requires:
-///   1. Cooperative key-path spend (get partial sig from Boltz + combine with claim_key)
+///   1. Cooperative key-path spend (Boltz partial sig + the host wallet's claim-key signature)
 ///   2. OR script-path spend using the HTLC leaf
 ///
 /// The cooperative path produces a standard Schnorr signature, minimizing
@@ -212,15 +211,13 @@ pub async fn wait_and_claim_reverse(
 ///
 /// Not implemented: there is no Taproot claim builder and no broadcast path, so this
 /// fails closed rather than recording a claim that never reached the chain. The swap
-/// stays `TransactionConfirmed` with its preimage and claim key persisted for recovery.
-fn build_and_broadcast_claim(record: &SwapRecord) -> Result<String> {
-    record
-        .lockup_txid
-        .as_deref()
-        .ok_or_else(|| SwapError::Key("Lockup txid missing from swap record".into()))?;
-
+/// stays `TransactionConfirmed` with its preimage persisted for recovery; the claim
+/// key stays with the host wallet.
+fn build_and_broadcast_claim(_record: &SwapRecord) -> Result<String> {
+    // Report the missing implementation first: records created by `create_reverse`
+    // have no lockup txid yet, which would otherwise mask the real cause.
     Err(SwapError::Key(
-        "Taproot claim broadcast not yet implemented — secrets preserved for recovery".into(),
+        "Taproot claim broadcast not yet implemented — preimage preserved for recovery".into(),
     ))
 }
 

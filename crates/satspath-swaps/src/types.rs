@@ -140,15 +140,35 @@ pub struct SwapRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preimage_hash_hex: Option<String>,
 
-    /// Client's ephemeral refund key (hex-encoded WIF/secret scalar).
-    /// Used to reclaim funds if the swap fails.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refund_key_hex: Option<String>,
+    /// Host-wallet public key (hex, compressed) that can refund the lockup.
+    /// SatsPath never holds the matching secret key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_pubkey_hex: Option<String>,
 
-    /// Client's ephemeral claim key (hex-encoded secret scalar).
-    /// Used to claim on-chain funds in Reverse/Chain swaps.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim_key_hex: Option<String>,
+    /// Host-wallet public key (hex, compressed) that can claim the lockup.
+    /// SatsPath never holds the matching secret key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_pubkey_hex: Option<String>,
+
+    /// Legacy only: a secret refund key stored by SatsPath versions that
+    /// generated swap keys themselves. Never set by current code; kept so a
+    /// rewrite of the store does not destroy an existing swap's recovery key.
+    #[serde(
+        default,
+        rename = "refund_key_hex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_refund_key_hex: Option<String>,
+
+    /// Legacy only: a secret claim key stored by SatsPath versions that
+    /// generated swap keys themselves. Never set by current code; see
+    /// `legacy_refund_key_hex`.
+    #[serde(
+        default,
+        rename = "claim_key_hex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_claim_key_hex: Option<String>,
 
     /// The Lightning invoice to pay (Submarine) or that was generated (Reverse).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +211,15 @@ pub struct SwapRecord {
 
     /// Unix timestamp of the last status update.
     pub updated_at: i64,
+}
+
+/// Validate a host-wallet swap public key (compressed secp256k1, hex) and
+/// return it in canonical form.
+pub fn parse_swap_pubkey(pubkey_hex: &str, label: &str) -> crate::errors::Result<String> {
+    use std::str::FromStr;
+    secp256k1::PublicKey::from_str(pubkey_hex.trim())
+        .map(|pk| hex::encode(pk.serialize()))
+        .map_err(|e| crate::errors::SwapError::Key(format!("Invalid {label} public key: {e}")))
 }
 
 impl SwapRecord {

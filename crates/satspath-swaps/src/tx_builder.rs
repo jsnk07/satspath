@@ -1,18 +1,28 @@
+//! Unsigned claim/refund transactions for P2WSH HTLC swaps.
+//!
+//! SatsPath never holds swap spending keys. The builders here return a PSBT
+//! for the host wallet to sign (see `WalletExecutor::sign_and_broadcast_psbt`),
+//! and the `finalize_*` helpers assemble the HTLC witness from the signature
+//! the wallet returns.
+//!
+//! Only P2WSH HTLCs are supported. Boltz v2 Taproot swaps need a MuSig2
+//! key-path or BIP-341 script-path spend, which these builders do not produce.
+
 use std::str::FromStr;
 
+use base64::Engine;
 use bitcoin::absolute::LockTime;
-use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::psbt::{Psbt, PsbtSighashType};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
-    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Witness,
+    Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
 
 use crate::errors::{Result, SwapError};
 use crate::types::SwapRecord;
 
-/// Parameters to build an on-chain Claim transaction for a Reverse Swap or Chain Swap.
+/// Parameters to build an unsigned claim transaction for a Reverse swap.
 #[derive(Debug, Clone)]
 pub struct ReverseClaimTxParams {
     /// Swap identifier.
@@ -23,19 +33,19 @@ pub struct ReverseClaimTxParams {
     pub lockup_vout: u32,
     /// Amount locked by Boltz in satoshis.
     pub lockup_amount_sats: u64,
+    /// P2WSH address of the lockup output; must commit to the witness script.
+    pub lockup_address: String,
     /// 32-byte secret preimage in hex (revealed on-chain to claim funds).
     pub preimage_hex: String,
-    /// Ephemeral private key hex for the claim output.
-    pub claim_key_hex: String,
     /// Destination address where claimed funds will land.
     pub destination_address: String,
-    /// P2WSH HTLC witness script hex. Required: the claim cannot be signed without it.
+    /// P2WSH HTLC witness script hex. Required: the claim cannot be spent without it.
     pub redeem_script_hex: Option<String>,
     /// Miner fee to deduct from the lockup amount (in sats, default 1,000).
     pub miner_fee_sats: u64,
 }
 
-/// Parameters to build an on-chain Refund transaction for a Submarine Swap or Chain Swap.
+/// Parameters to build an unsigned refund transaction for a Submarine swap.
 #[derive(Debug, Clone)]
 pub struct SubmarineRefundTxParams {
     /// Swap identifier.
@@ -46,238 +56,115 @@ pub struct SubmarineRefundTxParams {
     pub lockup_vout: u32,
     /// Amount locked by client in satoshis.
     pub lockup_amount_sats: u64,
-    /// Ephemeral private key hex for the refund output.
-    pub refund_key_hex: String,
+    /// P2WSH address of the lockup output; must commit to the witness script.
+    pub lockup_address: String,
     /// CLTV timeout block height after which refund is valid.
     pub timeout_block_height: u32,
     /// Destination address where refunded funds will land.
     pub destination_address: String,
-    /// P2WSH HTLC witness script hex. Required: the refund cannot be signed without it.
+    /// P2WSH HTLC witness script hex. Required: the refund cannot be spent without it.
     pub redeem_script_hex: Option<String>,
     /// Miner fee to deduct from the lockup amount (in sats, default 1,000).
     pub miner_fee_sats: u64,
 }
 
-/// Built transaction ready for broadcasting, along with its calculated txid and fee.
+/// An unsigned swap transaction ready for the host wallet to sign.
 #[derive(Debug, Clone)]
-pub struct BuiltSwapTx {
-    pub transaction: Transaction,
+pub struct UnsignedSwapTx {
+    /// PSBT carrying the witness UTXO, witness script and sighash type
+    /// (and, for claims, the preimage) the wallet needs to sign input 0.
+    pub psbt: Psbt,
+    /// `psbt` serialized as base64, for `WalletExecutor::sign_and_broadcast_psbt`.
+    pub psbt_base64: String,
+    /// Transaction ID. Segwit txids do not depend on the witness, so this is final.
     pub txid: String,
-    pub raw_hex: String,
+    /// BIP-143 SIGHASH_ALL digest of input 0, hex-encoded.
+    pub sighash_hex: String,
+    /// HTLC witness script, hex-encoded.
+    pub witness_script_hex: String,
+    /// Value of the single output in satoshis.
     pub output_amount_sats: u64,
+    /// Miner fee in satoshis.
     pub fee_sats: u64,
 }
 
-/// Build an on-chain Claim transaction for a confirmed Reverse swap.
+/// Build an unsigned claim transaction for a confirmed Reverse swap.
 ///
-/// Spends a P2WSH HTLC lockup UTXO by fulfilling the hash-lock (revealing the 32-byte
-/// preimage) and signing the BIP-143 sighash with the claim private key.
-///
-/// Only P2WSH HTLCs are supported. Boltz v2 Taproot swaps need a MuSig2 key-path or
-/// BIP-341 script-path spend, which this builder does not produce.
-pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<BuiltSwapTx> {
-    if params.lockup_amount_sats <= params.miner_fee_sats {
-        return Err(SwapError::Key(format!(
-            "Lockup amount {} sats is too low to cover miner fee {} sats",
-            params.lockup_amount_sats, params.miner_fee_sats
-        )));
-    }
-
-    let net_output_sats = params.lockup_amount_sats - params.miner_fee_sats;
-
-    let txid = Txid::from_str(&params.lockup_txid)
-        .map_err(|e| SwapError::Key(format!("Invalid lockup txid: {e}")))?;
-
-    let outpoint = OutPoint {
-        txid,
-        vout: params.lockup_vout,
-    };
-
-    let dest_address = Address::from_str(&params.destination_address)
-        .map_err(|e| SwapError::Key(format!("Invalid destination address: {e}")))?
-        .assume_checked();
-
-    let tx_in = TxIn {
-        previous_output: outpoint,
-        script_sig: ScriptBuf::new(),
-        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-        witness: Witness::new(),
-    };
-
-    let tx_out = TxOut {
-        value: Amount::from_sat(net_output_sats),
-        script_pubkey: dest_address.script_pubkey(),
-    };
-
-    let mut tx = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![tx_in],
-        output: vec![tx_out],
-    };
-
-    // Decode preimage and claim key
-    let preimage_bytes = hex::decode(&params.preimage_hex)
-        .map_err(|e| SwapError::Key(format!("Invalid preimage hex: {e}")))?;
-    if preimage_bytes.len() != 32 {
-        return Err(SwapError::Key("Preimage must be 32 bytes".into()));
-    }
-
-    let claim_key_bytes = hex::decode(&params.claim_key_hex)
-        .map_err(|e| SwapError::Key(format!("Invalid claim key hex: {e}")))?;
-    let secp = Secp256k1::new();
-    let claim_secret = SecretKey::from_slice(&claim_key_bytes)
-        .map_err(|e| SwapError::Key(format!("Invalid claim secret key: {e}")))?;
-
-    let redeem_script = decode_witness_script(params.redeem_script_hex.as_deref())?;
-    let sig_der = sign_p2wsh_input(
-        &tx,
-        &redeem_script,
+/// The returned PSBT spends the P2WSH HTLC lockup to `destination_address`
+/// and carries the preimage in `sha256_preimages`. After the host wallet signs
+/// input 0, pass its signature to [`finalize_reverse_claim`].
+pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<UnsignedSwapTx> {
+    let preimage = decode_preimage(&params.preimage_hex)?;
+    let input = HtlcInput::new(
+        &params.lockup_txid,
+        params.lockup_vout,
         params.lockup_amount_sats,
-        &claim_secret,
-        &secp,
+        &params.lockup_address,
+        params.redeem_script_hex.as_deref(),
     )?;
 
-    // Witness stack for P2WSH HTLC claim spend: [signature, preimage, witness_script]
-    let mut witness = Witness::new();
-    witness.push(sig_der);
-    witness.push(preimage_bytes);
-    witness.push(redeem_script.as_bytes());
-
-    tx.input[0].witness = witness;
-
-    let computed_txid = tx.compute_txid().to_string();
-    let raw_hex = hex::encode(bitcoin::consensus::serialize(&tx));
-
-    Ok(BuiltSwapTx {
-        transaction: tx,
-        txid: computed_txid,
-        raw_hex,
-        output_amount_sats: net_output_sats,
-        fee_sats: params.miner_fee_sats,
-    })
+    let mut built = input.build_unsigned(
+        &params.destination_address,
+        params.miner_fee_sats,
+        LockTime::ZERO,
+        Sequence::ENABLE_RBF_NO_LOCKTIME,
+    )?;
+    built
+        .psbt
+        .inputs
+        .get_mut(0)
+        .expect("PSBT has one input")
+        .sha256_preimages
+        .insert(sha256::Hash::hash(&preimage), preimage.to_vec());
+    built.psbt_base64 = encode_psbt(&built.psbt);
+    Ok(built)
 }
 
-/// Build an on-chain Refund transaction for an expired Submarine swap.
+/// Build an unsigned refund transaction for an expired Submarine swap.
 ///
-/// Spends a P2WSH HTLC lockup UTXO after `timeout_block_height`, signing the BIP-143
-/// sighash with the client's refund private key. Taproot lockups are not supported.
-pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<BuiltSwapTx> {
-    if params.lockup_amount_sats <= params.miner_fee_sats {
-        return Err(SwapError::Key(format!(
-            "Lockup amount {} sats is too low to cover miner fee {} sats",
-            params.lockup_amount_sats, params.miner_fee_sats
-        )));
-    }
-
-    let net_output_sats = params.lockup_amount_sats - params.miner_fee_sats;
-
-    let txid = Txid::from_str(&params.lockup_txid)
-        .map_err(|e| SwapError::Key(format!("Invalid lockup txid: {e}")))?;
-
-    let outpoint = OutPoint {
-        txid,
-        vout: params.lockup_vout,
-    };
-
-    let dest_address = Address::from_str(&params.destination_address)
-        .map_err(|e| SwapError::Key(format!("Invalid destination address: {e}")))?
-        .assume_checked();
-
+/// The returned PSBT spends the P2WSH HTLC lockup after `timeout_block_height`.
+/// After the host wallet signs input 0, pass its signature to
+/// [`finalize_submarine_refund`].
+pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<UnsignedSwapTx> {
     let lock_time = LockTime::from_height(params.timeout_block_height)
         .map_err(|e| SwapError::Key(format!("Invalid timeout block height: {e}")))?;
-
-    let tx_in = TxIn {
-        previous_output: outpoint,
-        script_sig: ScriptBuf::new(),
-        sequence: Sequence::from_height(1),
-        witness: Witness::new(),
-    };
-
-    let tx_out = TxOut {
-        value: Amount::from_sat(net_output_sats),
-        script_pubkey: dest_address.script_pubkey(),
-    };
-
-    let mut tx = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time,
-        input: vec![tx_in],
-        output: vec![tx_out],
-    };
-
-    // Decode refund secret key
-    let refund_key_bytes = hex::decode(&params.refund_key_hex)
-        .map_err(|e| SwapError::Key(format!("Invalid refund key hex: {e}")))?;
-    let secp = Secp256k1::new();
-    let refund_secret = SecretKey::from_slice(&refund_key_bytes)
-        .map_err(|e| SwapError::Key(format!("Invalid refund secret key: {e}")))?;
-
-    let redeem_script = decode_witness_script(params.redeem_script_hex.as_deref())?;
-    let sig_der = sign_p2wsh_input(
-        &tx,
-        &redeem_script,
+    let input = HtlcInput::new(
+        &params.lockup_txid,
+        params.lockup_vout,
         params.lockup_amount_sats,
-        &refund_secret,
-        &secp,
+        &params.lockup_address,
+        params.redeem_script_hex.as_deref(),
     )?;
 
-    // Witness stack for refund:
-    // [signature, 0, redeem_script] (CLTV branch)
-    let mut witness = Witness::new();
-    witness.push(sig_der);
-    witness.push(vec![]); // 0 pushes false to select the timeout branch
-    witness.push(redeem_script.as_bytes());
-
-    tx.input[0].witness = witness;
-
-    let computed_txid = tx.compute_txid().to_string();
-    let raw_hex = hex::encode(bitcoin::consensus::serialize(&tx));
-
-    Ok(BuiltSwapTx {
-        transaction: tx,
-        txid: computed_txid,
-        raw_hex,
-        output_amount_sats: net_output_sats,
-        fee_sats: params.miner_fee_sats,
-    })
+    // Any non-final sequence enables nLockTime, which the CLTV branch requires.
+    input.build_unsigned(
+        &params.destination_address,
+        params.miner_fee_sats,
+        lock_time,
+        Sequence::ENABLE_LOCKTIME_NO_RBF,
+    )
 }
 
-/// Decode the HTLC witness script. A missing script is an error: signing against a
-/// synthesized script would produce a spend that can never be valid on-chain.
-fn decode_witness_script(redeem_script_hex: Option<&str>) -> Result<ScriptBuf> {
-    let rs_hex = redeem_script_hex
-        .ok_or_else(|| SwapError::Key("Redeem script missing: cannot sign HTLC spend".into()))?;
-    let bytes = hex::decode(rs_hex)
-        .map_err(|e| SwapError::Key(format!("Invalid redeem script hex: {e}")))?;
-    if bytes.is_empty() {
-        return Err(SwapError::Key("Redeem script is empty".into()));
-    }
-    Ok(ScriptBuf::from_bytes(bytes))
+/// Assemble the claim witness `[signature, preimage, witness_script]` from the
+/// host wallet's signature over [`UnsignedSwapTx::sighash_hex`].
+///
+/// `signature` is a DER-encoded ECDSA signature followed by the SIGHASH_ALL byte.
+pub fn finalize_reverse_claim(
+    unsigned: &UnsignedSwapTx,
+    signature: &[u8],
+    preimage_hex: &str,
+) -> Result<Transaction> {
+    let preimage = decode_preimage(preimage_hex)?;
+    finalize(unsigned, signature, preimage.to_vec())
 }
 
-/// Sign input 0 of `tx` as a P2WSH spend using the BIP-143 segwit v0 sighash,
-/// returning a DER signature with the SIGHASH_ALL byte appended.
-fn sign_p2wsh_input(
-    tx: &Transaction,
-    witness_script: &ScriptBuf,
-    prevout_amount_sats: u64,
-    secret: &SecretKey,
-    secp: &Secp256k1<bitcoin::secp256k1::All>,
-) -> Result<Vec<u8>> {
-    let sighash = SighashCache::new(tx)
-        .p2wsh_signature_hash(
-            0,
-            witness_script,
-            Amount::from_sat(prevout_amount_sats),
-            EcdsaSighashType::All,
-        )
-        .map_err(|e| SwapError::Key(format!("Sighash computation failed: {e}")))?;
-    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-    let sig = secp.sign_ecdsa(&msg, secret);
-    let mut sig_der = sig.serialize_der().to_vec();
-    sig_der.push(EcdsaSighashType::All.to_u32() as u8);
-    Ok(sig_der)
+/// Assemble the refund witness `[signature, <empty>, witness_script]` from the
+/// host wallet's signature. The empty element selects the HTLC's timeout branch.
+pub fn finalize_submarine_refund(
+    unsigned: &UnsignedSwapTx,
+    signature: &[u8],
+) -> Result<Transaction> {
+    finalize(unsigned, signature, Vec::new())
 }
 
 /// Helper to build claim parameters directly from a persisted SwapRecord.
@@ -292,20 +179,13 @@ pub fn claim_params_from_record(
         .clone()
         .ok_or_else(|| SwapError::Key("Record missing preimage".into()))?;
 
-    let claim_key_hex = record
-        .claim_key_hex
-        .clone()
-        .ok_or_else(|| SwapError::Key("Record missing claim key".into()))?;
-
-    let lockup_amount_sats = record.expected_amount_sats.unwrap_or(record.amount_sats);
-
     Ok(ReverseClaimTxParams {
         swap_id: record.id.clone(),
         lockup_txid: lockup_txid.to_string(),
         lockup_vout,
-        lockup_amount_sats,
+        lockup_amount_sats: record.expected_amount_sats.unwrap_or(record.amount_sats),
+        lockup_address: record_lockup_address(record)?,
         preimage_hex,
-        claim_key_hex,
         destination_address: destination_address.to_string(),
         redeem_script_hex: record.redeem_script.clone(),
         miner_fee_sats: 1000,
@@ -319,23 +199,16 @@ pub fn refund_params_from_record(
     lockup_vout: u32,
     destination_address: &str,
 ) -> Result<SubmarineRefundTxParams> {
-    let refund_key_hex = record
-        .refund_key_hex
-        .clone()
-        .ok_or_else(|| SwapError::Key("Record missing refund key".into()))?;
-
     let timeout_block_height = record
         .timeout_block_height
         .ok_or_else(|| SwapError::Key("Record missing timeout block height".into()))?;
-
-    let lockup_amount_sats = record.expected_amount_sats.unwrap_or(record.amount_sats);
 
     Ok(SubmarineRefundTxParams {
         swap_id: record.id.clone(),
         lockup_txid: lockup_txid.to_string(),
         lockup_vout,
-        lockup_amount_sats,
-        refund_key_hex,
+        lockup_amount_sats: record.expected_amount_sats.unwrap_or(record.amount_sats),
+        lockup_address: record_lockup_address(record)?,
         timeout_block_height,
         destination_address: destination_address.to_string(),
         redeem_script_hex: record.redeem_script.clone(),
@@ -343,102 +216,329 @@ pub fn refund_params_from_record(
     })
 }
 
+/// The lockup UTXO being spent, with its witness script checked against the
+/// lockup address.
+struct HtlcInput {
+    outpoint: OutPoint,
+    amount_sats: u64,
+    script_pubkey: ScriptBuf,
+    witness_script: ScriptBuf,
+}
+
+impl HtlcInput {
+    fn new(
+        lockup_txid: &str,
+        lockup_vout: u32,
+        amount_sats: u64,
+        lockup_address: &str,
+        redeem_script_hex: Option<&str>,
+    ) -> Result<Self> {
+        let txid = Txid::from_str(lockup_txid)
+            .map_err(|e| SwapError::Key(format!("Invalid lockup txid: {e}")))?;
+        let witness_script = decode_witness_script(redeem_script_hex)?;
+
+        // A script that does not hash to the lockup output yields a transaction
+        // that can never spend it, so reject the mismatch before anything is signed.
+        let script_pubkey = parse_address(lockup_address, "lockup")?.script_pubkey();
+        if script_pubkey != ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) {
+            return Err(SwapError::Key(
+                "Redeem script does not match the lockup address (P2WSH commitment mismatch)"
+                    .into(),
+            ));
+        }
+
+        Ok(Self {
+            outpoint: OutPoint {
+                txid,
+                vout: lockup_vout,
+            },
+            amount_sats,
+            script_pubkey,
+            witness_script,
+        })
+    }
+
+    fn build_unsigned(
+        &self,
+        destination_address: &str,
+        miner_fee_sats: u64,
+        lock_time: LockTime,
+        sequence: Sequence,
+    ) -> Result<UnsignedSwapTx> {
+        if self.amount_sats <= miner_fee_sats {
+            return Err(SwapError::Key(format!(
+                "Lockup amount {} sats is too low to cover miner fee {} sats",
+                self.amount_sats, miner_fee_sats
+            )));
+        }
+        let output_amount_sats = self.amount_sats - miner_fee_sats;
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time,
+            input: vec![TxIn {
+                previous_output: self.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(output_amount_sats),
+                script_pubkey: parse_address(destination_address, "destination")?.script_pubkey(),
+            }],
+        };
+
+        let sighash = SighashCache::new(&tx)
+            .p2wsh_signature_hash(
+                0,
+                &self.witness_script,
+                Amount::from_sat(self.amount_sats),
+                EcdsaSighashType::All,
+            )
+            .map_err(|e| SwapError::Key(format!("Sighash computation failed: {e}")))?;
+
+        let mut psbt = Psbt::from_unsigned_tx(tx.clone())
+            .map_err(|e| SwapError::Key(format!("PSBT construction failed: {e}")))?;
+        let input = &mut psbt.inputs[0];
+        input.witness_utxo = Some(TxOut {
+            value: Amount::from_sat(self.amount_sats),
+            script_pubkey: self.script_pubkey.clone(),
+        });
+        input.witness_script = Some(self.witness_script.clone());
+        input.sighash_type = Some(PsbtSighashType::from(EcdsaSighashType::All));
+
+        Ok(UnsignedSwapTx {
+            psbt_base64: encode_psbt(&psbt),
+            psbt,
+            txid: tx.compute_txid().to_string(),
+            sighash_hex: hex::encode(sighash.to_byte_array()),
+            witness_script_hex: hex::encode(self.witness_script.as_bytes()),
+            output_amount_sats,
+            fee_sats: miner_fee_sats,
+        })
+    }
+}
+
+/// Place `[signature, branch_selector, witness_script]` on input 0.
+fn finalize(
+    unsigned: &UnsignedSwapTx,
+    signature: &[u8],
+    branch_selector: Vec<u8>,
+) -> Result<Transaction> {
+    let (sighash_byte, der) = signature
+        .split_last()
+        .ok_or_else(|| SwapError::Key("Empty signature".into()))?;
+    if u32::from(*sighash_byte) != EcdsaSighashType::All.to_u32() {
+        return Err(SwapError::Key("Signature must use SIGHASH_ALL".into()));
+    }
+    bitcoin::secp256k1::ecdsa::Signature::from_der(der)
+        .map_err(|e| SwapError::Key(format!("Invalid DER signature: {e}")))?;
+
+    let witness_script = unsigned.psbt.inputs[0]
+        .witness_script
+        .clone()
+        .ok_or_else(|| SwapError::Key("PSBT is missing the witness script".into()))?;
+
+    let mut tx = unsigned.psbt.unsigned_tx.clone();
+    let mut witness = Witness::new();
+    witness.push(signature);
+    witness.push(branch_selector);
+    witness.push(witness_script.as_bytes());
+    tx.input[0].witness = witness;
+    Ok(tx)
+}
+
+fn decode_preimage(preimage_hex: &str) -> Result<[u8; 32]> {
+    hex::decode(preimage_hex)
+        .map_err(|e| SwapError::Key(format!("Invalid preimage hex: {e}")))?
+        .try_into()
+        .map_err(|_| SwapError::Key("Preimage must be 32 bytes".into()))
+}
+
+/// Decode the HTLC witness script. A missing script is an error: spending
+/// against a synthesized script would produce a transaction that can never be
+/// valid on-chain.
+fn decode_witness_script(redeem_script_hex: Option<&str>) -> Result<ScriptBuf> {
+    let rs_hex = redeem_script_hex
+        .ok_or_else(|| SwapError::Key("Redeem script missing: cannot spend HTLC".into()))?;
+    let bytes = hex::decode(rs_hex)
+        .map_err(|e| SwapError::Key(format!("Invalid redeem script hex: {e}")))?;
+    if bytes.is_empty() {
+        return Err(SwapError::Key("Redeem script is empty".into()));
+    }
+    Ok(ScriptBuf::from_bytes(bytes))
+}
+
+fn parse_address(address: &str, label: &str) -> Result<Address> {
+    Ok(Address::from_str(address)
+        .map_err(|e| SwapError::Key(format!("Invalid {label} address: {e}")))?
+        .assume_checked())
+}
+
+fn record_lockup_address(record: &SwapRecord) -> Result<String> {
+    record
+        .lockup_address
+        .clone()
+        .ok_or_else(|| SwapError::Key("Record missing lockup address".into()))
+}
+
+fn encode_psbt(psbt: &Psbt) -> String {
+    base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::Network;
 
-    #[test]
-    fn test_build_reverse_claim_tx_structure() {
-        let params = ReverseClaimTxParams {
-            swap_id: "swap_rev_test_1".into(),
-            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000001".into(),
-            lockup_vout: 0,
-            lockup_amount_sats: 50_000,
-            preimage_hex: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".into(),
-            claim_key_hex: "0101010101010101010101010101010101010101010101010101010101010101"
-                .into(),
-            destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
-            redeem_script_hex: Some("6352670068".into()),
-            miner_fee_sats: 1_200,
-        };
+    const DEST: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+    const PREIMAGE: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const SCRIPT: &str = "6352670068";
 
-        let built = build_reverse_claim_tx(params).expect("build reverse claim tx");
-        assert_eq!(built.output_amount_sats, 48_800);
-        assert_eq!(built.fee_sats, 1_200);
-        assert_eq!(built.transaction.output.len(), 1);
-        assert_eq!(built.transaction.output[0].value.to_sat(), 48_800);
-        assert_eq!(built.transaction.input.len(), 1);
-        assert_eq!(built.transaction.input[0].witness.len(), 3);
-        assert_eq!(built.txid.len(), 64);
-        assert!(!built.raw_hex.is_empty());
-    }
-
-    #[test]
-    fn test_build_submarine_refund_tx_structure() {
-        let params = SubmarineRefundTxParams {
-            swap_id: "swap_sub_test_1".into(),
-            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000002".into(),
-            lockup_vout: 1,
-            lockup_amount_sats: 100_000,
-            refund_key_hex: "0202020202020202020202020202020202020202020202020202020202020202"
-                .into(),
-            timeout_block_height: 850_000,
-            destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
-            redeem_script_hex: Some("6352670168".into()),
-            miner_fee_sats: 1_500,
-        };
-
-        let built = build_submarine_refund_tx(params).expect("build submarine refund tx");
-        assert_eq!(built.output_amount_sats, 98_500);
-        assert_eq!(built.fee_sats, 1_500);
-        assert_eq!(built.transaction.lock_time.to_consensus_u32(), 850_000);
-        assert_eq!(built.transaction.output[0].value.to_sat(), 98_500);
-        assert_eq!(built.transaction.input[0].witness.len(), 3);
-        assert_eq!(built.txid.len(), 64);
+    fn lockup_address(script_hex: &str) -> String {
+        let script = ScriptBuf::from_bytes(hex::decode(script_hex).unwrap());
+        Address::p2wsh(&script, Network::Testnet).to_string()
     }
 
     fn claim_params(redeem_script_hex: Option<String>) -> ReverseClaimTxParams {
         ReverseClaimTxParams {
-            swap_id: "swap_rev_sig".into(),
+            swap_id: "swap_rev".into(),
             lockup_txid: "0000000000000000000000000000000000000000000000000000000000000003".into(),
             lockup_vout: 0,
             lockup_amount_sats: 60_000,
-            preimage_hex: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".into(),
-            claim_key_hex: "0303030303030303030303030303030303030303030303030303030303030303"
-                .into(),
-            destination_address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
+            lockup_address: lockup_address(SCRIPT),
+            preimage_hex: PREIMAGE.into(),
+            destination_address: DEST.into(),
             redeem_script_hex,
             miner_fee_sats: 1_000,
         }
     }
 
-    #[test]
-    fn claim_signature_commits_to_bip143_sighash() {
-        let script = ScriptBuf::from_bytes(hex::decode("6352670068").unwrap());
-        let built =
-            build_reverse_claim_tx(claim_params(Some("6352670068".into()))).expect("build claim");
+    /// Stands in for the host wallet: SatsPath itself never signs.
+    fn wallet_sign(sighash_hex: &str, secret: &SecretKey) -> Vec<u8> {
+        let digest: [u8; 32] = hex::decode(sighash_hex).unwrap().try_into().unwrap();
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), secret);
+        let mut out = sig.serialize_der().to_vec();
+        out.push(EcdsaSighashType::All.to_u32() as u8);
+        out
+    }
 
-        let mut unsigned = built.transaction.clone();
-        unsigned.input[0].witness = Witness::new();
-        let sighash = SighashCache::new(&unsigned)
+    #[test]
+    fn reverse_claim_psbt_carries_what_the_wallet_needs() {
+        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
+        assert_eq!(built.output_amount_sats, 59_000);
+        assert_eq!(built.fee_sats, 1_000);
+
+        let input = &built.psbt.inputs[0];
+        let script = ScriptBuf::from_bytes(hex::decode(SCRIPT).unwrap());
+        assert_eq!(input.witness_script.as_ref(), Some(&script));
+        let utxo = input.witness_utxo.as_ref().unwrap();
+        assert_eq!(utxo.value.to_sat(), 60_000);
+        assert_eq!(
+            utxo.script_pubkey,
+            ScriptBuf::new_p2wsh(&script.wscript_hash())
+        );
+        let preimage = hex::decode(PREIMAGE).unwrap();
+        assert_eq!(
+            input.sha256_preimages.get(&sha256::Hash::hash(&preimage)),
+            Some(&preimage)
+        );
+        assert!(built.psbt.unsigned_tx.input[0].witness.is_empty());
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&built.psbt_base64)
+            .unwrap();
+        assert_eq!(Psbt::deserialize(&decoded).unwrap(), built.psbt);
+    }
+
+    #[test]
+    fn sighash_is_the_bip143_digest() {
+        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
+        let script = ScriptBuf::from_bytes(hex::decode(SCRIPT).unwrap());
+        let expected = SighashCache::new(&built.psbt.unsigned_tx)
             .p2wsh_signature_hash(0, &script, Amount::from_sat(60_000), EcdsaSighashType::All)
             .unwrap();
-        let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        assert_eq!(built.sighash_hex, hex::encode(expected.to_byte_array()));
+    }
 
-        let sig_bytes = built.transaction.input[0].witness.nth(0).unwrap();
-        let (sighash_byte, der) = sig_bytes.split_last().unwrap();
-        assert_eq!(*sighash_byte, EcdsaSighashType::All.to_u32() as u8);
-        let sig = bitcoin::secp256k1::ecdsa::Signature::from_der(der).unwrap();
+    #[test]
+    fn finalized_claim_has_htlc_witness_and_verifiable_signature() {
+        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
+        let secret = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let sig = wallet_sign(&built.sighash_hex, &secret);
 
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
-        secp.verify_ecdsa(&msg, &sig, &sk.public_key(&secp))
-            .expect("signature must verify against the segwit v0 sighash");
+        let tx = finalize_reverse_claim(&built, &sig, PREIMAGE).unwrap();
+        let witness = &tx.input[0].witness;
+        assert_eq!(witness.len(), 3);
+        assert_eq!(witness.nth(0).unwrap(), &sig[..]);
+        assert_eq!(witness.nth(1).unwrap(), &hex::decode(PREIMAGE).unwrap()[..]);
+        assert_eq!(witness.nth(2).unwrap(), &hex::decode(SCRIPT).unwrap()[..]);
+        assert_eq!(tx.compute_txid().to_string(), built.txid);
+
+        let digest: [u8; 32] = hex::decode(&built.sighash_hex).unwrap().try_into().unwrap();
+        let der = bitcoin::secp256k1::ecdsa::Signature::from_der(&sig[..sig.len() - 1]).unwrap();
+        Secp256k1::new()
+            .verify_ecdsa(
+                &Message::from_digest(digest),
+                &der,
+                &secret.public_key(&Secp256k1::new()),
+            )
+            .expect("signature over the PSBT sighash must verify");
+    }
+
+    #[test]
+    fn mismatched_redeem_script_is_rejected() {
+        let mut params = claim_params(Some(SCRIPT.into()));
+        params.lockup_address = lockup_address("6352670168");
+        let err = build_reverse_claim_tx(params).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match the lockup address"));
     }
 
     #[test]
     fn claim_without_redeem_script_is_rejected() {
         let err = build_reverse_claim_tx(claim_params(None)).unwrap_err();
         assert!(err.to_string().contains("Redeem script missing"));
+    }
+
+    #[test]
+    fn finalize_rejects_non_sighash_all_signature() {
+        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
+        let mut sig = wallet_sign(
+            &built.sighash_hex,
+            &SecretKey::from_slice(&[3u8; 32]).unwrap(),
+        );
+        *sig.last_mut().unwrap() = EcdsaSighashType::None.to_u32() as u8;
+        assert!(finalize_reverse_claim(&built, &sig, PREIMAGE).is_err());
+    }
+
+    #[test]
+    fn submarine_refund_is_timelocked_and_finalizes_on_timeout_branch() {
+        let built = build_submarine_refund_tx(SubmarineRefundTxParams {
+            swap_id: "swap_sub".into(),
+            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000002".into(),
+            lockup_vout: 1,
+            lockup_amount_sats: 100_000,
+            lockup_address: lockup_address("6352670168"),
+            timeout_block_height: 850_000,
+            destination_address: DEST.into(),
+            redeem_script_hex: Some("6352670168".into()),
+            miner_fee_sats: 1_500,
+        })
+        .unwrap();
+        assert_eq!(built.output_amount_sats, 98_500);
+        let unsigned = &built.psbt.unsigned_tx;
+        assert_eq!(unsigned.lock_time.to_consensus_u32(), 850_000);
+        assert!(unsigned.input[0].sequence.enables_absolute_lock_time());
+
+        let sig = wallet_sign(
+            &built.sighash_hex,
+            &SecretKey::from_slice(&[2u8; 32]).unwrap(),
+        );
+        let tx = finalize_submarine_refund(&built, &sig).unwrap();
+        assert_eq!(tx.input[0].witness.len(), 3);
+        assert!(tx.input[0].witness.nth(1).unwrap().is_empty());
     }
 }
