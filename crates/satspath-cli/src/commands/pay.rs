@@ -16,6 +16,7 @@ use satspath_router::{select_route, RouteRequest, SwapDirective};
 
 use super::get_resolver;
 
+/// `satspath pay`: resolve and verify the recipient, then preview a route. Never moves funds.
 pub async fn cmd_pay(
     alias: &str,
     amount_sats: u64,

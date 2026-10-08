@@ -172,6 +172,7 @@ mod tests {
             .unwrap()
     }
 
+    /// A DNSSEC-validated BOLT12 offer maps to an Ok quote.
     #[test]
     fn bip353_bolt12_maps_to_ok_quote() {
         let res = resolution(BIP353_OFFER_URI, true);
@@ -199,6 +200,7 @@ mod tests {
         }
     }
 
+    /// A mainnet address maps to an on-chain method.
     #[test]
     fn bip353_onchain_maps_to_onchain_method() {
         let res = resolution(
@@ -222,6 +224,7 @@ mod tests {
         }
     }
 
+    /// An unvalidated record marks the recipient unverified.
     #[test]
     fn bip353_unvalidated_dnssec_marks_recipient_unverified() {
         let res = resolution(BIP353_OFFER_URI, false);

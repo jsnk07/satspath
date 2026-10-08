@@ -202,6 +202,7 @@ mod tests {
         }
     }
 
+    /// Creating the identity persists only public wallet state.
     #[test]
     fn identity_creation_persists_public_wallet_state_only() {
         let dir = tempfile::tempdir().unwrap();

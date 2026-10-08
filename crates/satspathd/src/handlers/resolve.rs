@@ -187,6 +187,7 @@ pub(crate) fn resolve_v2_envelope(
     })
 }
 
+/// /v1/dns/resolve: resolve a BIP-353 name and validate its payment instruction.
 pub(crate) async fn dns_resolve_response(body: DnsResolveRequest) -> DnsResolveResponse {
     let policy = if body.allow_insecure_dns_for_dev {
         DnssecPolicy::DevInsecure

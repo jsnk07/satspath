@@ -44,6 +44,7 @@ pub struct Bip353Resolver {
 }
 
 impl Default for Bip353Resolver {
+    /// Same as [`Bip353Resolver::new`].
     fn default() -> Self {
         Self::new()
     }

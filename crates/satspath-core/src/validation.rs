@@ -37,6 +37,7 @@ pub fn validate_compressed_pubkey(pubkey_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a Lightning address (`user@domain`).
 pub fn validate_lightning_address(address: &str) -> Result<()> {
     let trimmed = address.trim();
     let Some((local, domain)) = trimmed.split_once('@') else {
