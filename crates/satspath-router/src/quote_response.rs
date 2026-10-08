@@ -229,6 +229,7 @@ fn sats_to_btc(amount_sats: u64) -> String {
 /// `NoRoute` reason for a recipient whose profile was revoked by its owner.
 pub const PROFILE_REVOKED_REASON: &str = "Profile revoked by its owner.";
 
+/// Quote a payment: resolve, verify, and pick a route; only an unregistered recipient gets an invite.
 async fn quote_inner<R>(
     resolver: &R,
     recipient: &str,
@@ -270,6 +271,7 @@ where
     route_verified_signed(signed, recipient, amount_sats, fees, fetch_ln_invoice).await
 }
 
+/// Pick a route for a recipient whose signed profile has been verified.
 async fn route_verified_signed(
     signed: satspath_core::SignedPaymentProfile,
     recipient: &str,
@@ -434,6 +436,7 @@ mod tests {
     }
 
     // Expensive next block (> 20 sat/vB): on-chain not acceptable.
+    /// A fee estimate high enough to rule out on-chain routes.
     fn expensive_fees() -> FeeEstimate {
         FeeEstimate {
             fastest_fee: 35,

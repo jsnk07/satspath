@@ -190,6 +190,7 @@ impl NostrResolver {
 
 #[async_trait]
 impl ProfileResolver for NostrResolver {
+    /// Resolve via NIP-05 and the listed relays; a revoked result from any relay is final.
     async fn resolve_alias(&self, alias: &str) -> Result<SignedPaymentProfile> {
         let nip05 = self.resolve_nip05(alias).await?;
 
@@ -508,6 +509,7 @@ mod tests {
         assert_eq!(parsed.profile.alias, "alice@example.com");
     }
 
+    /// An event for a different alias is ignored.
     #[test]
     fn rejects_event_for_wrong_alias() {
         let profile = signed("bob@example.com");

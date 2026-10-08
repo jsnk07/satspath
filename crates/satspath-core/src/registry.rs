@@ -174,6 +174,7 @@ impl Registry {
         self.save()
     }
 
+    /// Look up a registered profile; a revoked profile is refused with ProfileRevoked.
     pub fn resolve_alias(&self, alias: &str) -> Result<&SignedPaymentProfile> {
         let canonical = canonical_identifier(alias);
         let key = identifier_hash(&canonical);

@@ -158,6 +158,7 @@ impl Default for ChainResolver {
 
 #[async_trait]
 impl ProfileResolver for ChainResolver {
+    /// Try each resolver in order. A substituted alias or a revoked profile stops the chain.
     async fn resolve_alias(&self, alias: &str) -> Result<SignedPaymentProfile> {
         let requested_canonical = canonical_identifier(alias);
         for resolver in &self.resolvers {

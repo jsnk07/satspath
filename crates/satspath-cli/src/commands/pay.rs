@@ -16,6 +16,7 @@ use satspath_router::{select_route, RouteRequest, SwapDirective};
 
 use super::get_resolver;
 
+/// `satspath pay`: resolve and verify the recipient, then preview a route. Never moves funds.
 pub async fn cmd_pay(
     alias: &str,
     amount_sats: u64,
@@ -521,6 +522,7 @@ fn network_name(network: BitcoinNetwork) -> &'static str {
     }
 }
 
+/// The fixed safety lines printed after every preview.
 fn preview_safety_lines() -> [&'static str; 5] {
     [
         "SatsPath Preview Mode",
