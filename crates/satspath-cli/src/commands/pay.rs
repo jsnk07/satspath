@@ -113,7 +113,6 @@ pub async fn cmd_pay(
             "  Key continuity: ROTATED from {} with an authorization signed by the trusted key.",
             mask_pubkey(previous_pubkey)
         ),
-        KeyContinuity::NotApplicable => {}
     }
 
     println!("Verifying signed profile...");

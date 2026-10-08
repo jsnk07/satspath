@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use secp256k1::SecretKey;
 
 use satspath_core::crypto::{generate_identity_keypair, sign_profile, verify_signed_profile};
-use satspath_core::key_pins::{KeyContinuity, MemoryKeyStore, PinnedResolver};
+use satspath_core::key_pins::{KeyContinuity, MemoryKeyStore, PinnedResolver, TrustedKeyStore};
 use satspath_core::privacy::identifier_hash;
 use satspath_core::profile::{PaymentMethod, PaymentProfile};
 use satspath_core::resolver::{ChainResolver, ProfileResolver};
@@ -185,4 +185,39 @@ async fn replayed_older_profile_is_rejected() {
             .is_err(),
         "an older, validly signed copy must not replace a newer one"
     );
+}
+
+/// A revoked profile is refused and its key is never pinned.
+#[tokio::test]
+async fn revoked_profile_is_refused_and_not_pinned() {
+    let (pk, sk) = keypair();
+    let mut revoked = profile(&pk, "alice@wallet.example", 1);
+    revoked.revoked = true;
+    let store = Arc::new(MemoryKeyStore::new());
+    let resolver = wallet_resolver(sign_profile(revoked, &sk).unwrap(), &store);
+
+    let result = resolver.resolve_alias(ALICE).await;
+    assert!(
+        matches!(result, Err(SatsPathError::ProfileRevoked(_))),
+        "{:?}",
+        result.map(|p| p.profile.identity_pubkey)
+    );
+    assert_eq!(
+        store.trusted_key(ALICE).unwrap(),
+        None,
+        "revoked key must not be pinned"
+    );
+}
+
+/// BIP-353 names are refused: they carry no identity key to check or pin.
+#[tokio::test]
+async fn bip353_name_is_refused_not_passed_through() {
+    let (pk, sk) = keypair();
+    let store = Arc::new(MemoryKeyStore::new());
+    let resolver = wallet_resolver(
+        sign_profile(profile(&pk, "alice@wallet.example", 1), &sk).unwrap(),
+        &store,
+    );
+    let result = resolver.resolve_alias("₿alice@example.com").await;
+    assert!(matches!(result, Err(SatsPathError::Bip353(_))));
 }

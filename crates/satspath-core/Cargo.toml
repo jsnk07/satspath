@@ -2,6 +2,8 @@
 name = "satspath-core"
 version = "0.1.0"
 edition = "2021"
+# key_pins uses std::fs::File::lock, stable since Rust 1.89.
+rust-version = "1.89"
 description = "Core types, cryptography, codec, and registry for SatsPath"
 
 [lib]

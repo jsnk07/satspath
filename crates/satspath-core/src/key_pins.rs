@@ -60,8 +60,6 @@ pub enum KeyContinuity {
     Matches,
     /// The key changed with a valid rotation authorized by the trusted key.
     Rotated { previous_pubkey: String },
-    /// The identifier has no SatsPath identity key to pin (BIP-353 names).
-    NotApplicable,
 }
 
 /// Storage for pinned identity keys. Keys are looked up by identifier; the raw
@@ -154,17 +152,29 @@ impl<R: ProfileResolver + Send + Sync> PinnedResolver<R> {
         &self,
         alias: &str,
     ) -> Result<(SignedPaymentProfile, KeyContinuity)> {
-        let signed = self.inner.resolve_alias(alias).await?;
-
-        // BIP-353 names resolve to DNS payment instructions, not to a
-        // SatsPath identity key, so there is nothing to pin.
+        // BIP-353 names resolve to DNSSEC-authenticated payment instructions,
+        // not to a SatsPath identity key. Nothing here can vouch for a key, so
+        // refuse instead of returning a profile that was never key-checked.
         if alias.trim().starts_with('₿') {
-            return Ok((signed, KeyContinuity::NotApplicable));
+            return Err(SatsPathError::Bip353(
+                "BIP-353 names resolve to DNS payment instructions, not to signed \
+                 SatsPath profiles; resolve them with `satspath dns resolve`"
+                    .into(),
+            ));
         }
+
+        let signed = self.inner.resolve_alias(alias).await?;
 
         // Never pin (or compare against) a key whose signature does not verify.
         if !verify_signed_profile(&signed)? {
             return Err(SatsPathError::InvalidSignature);
+        }
+
+        // A revoked profile is a hard stop: never pin its key, never return it.
+        if signed.profile.revoked {
+            return Err(SatsPathError::ProfileRevoked(
+                crate::peer_registry::canonicalize_identifier(alias),
+            ));
         }
 
         // Check and pin in one store transaction, so a concurrent resolver in
@@ -173,17 +183,23 @@ impl<R: ProfileResolver + Send + Sync> PinnedResolver<R> {
         self.store.update_pin(alias, &mut |pinned| {
             continuity = Some(check_key_continuity(alias, pinned, &signed)?);
 
-            let now = chrono::Utc::now().timestamp();
+            let pubkey = &signed.profile.identity_pubkey;
             let sequence = signed.profile.sequence.unwrap_or(0);
-            let updated = TrustedKey {
-                identity_pubkey: signed.profile.identity_pubkey.clone(),
-                sequence: pinned
-                    .filter(|p| p.identity_pubkey == signed.profile.identity_pubkey)
-                    .map_or(sequence, |p| p.sequence.max(sequence)),
+            let next_sequence = pinned
+                .filter(|p| &p.identity_pubkey == pubkey)
+                .map_or(sequence, |p| p.sequence.max(sequence));
+            // Same key, same sequence: nothing changed, so leave the pin file
+            // alone instead of rewriting it just to bump `updated_at`.
+            if pinned.is_some_and(|p| &p.identity_pubkey == pubkey && p.sequence == next_sequence) {
+                return Ok(None);
+            }
+            let now = chrono::Utc::now().timestamp();
+            Ok(Some(TrustedKey {
+                identity_pubkey: pubkey.clone(),
+                sequence: next_sequence,
                 first_seen: pinned.map_or(now, |p| p.first_seen),
                 updated_at: now,
-            };
-            Ok((pinned != Some(&updated)).then_some(updated))
+            }))
         })?;
 
         let continuity = continuity.expect("update_pin always calls decide on success");
@@ -217,17 +233,20 @@ impl MemoryKeyStore {
 }
 
 impl TrustedKeyStore for MemoryKeyStore {
+    /// Look up the pin under the hashed identifier.
     fn trusted_key(&self, identifier: &str) -> Result<Option<TrustedKey>> {
         let keys = self.keys.lock().map_err(lock_poisoned)?;
         Ok(keys.get(&hash_identifier(identifier)).cloned())
     }
 
+    /// Store the pin under the hashed identifier.
     fn pin_key(&self, identifier: &str, key: TrustedKey) -> Result<()> {
         let mut keys = self.keys.lock().map_err(lock_poisoned)?;
         keys.insert(hash_identifier(identifier), key);
         Ok(())
     }
 
+    /// Check and update under the store's mutex, so the two cannot interleave.
     fn update_pin(
         &self,
         identifier: &str,
@@ -316,10 +335,12 @@ impl FileKeyStore {
 }
 
 impl TrustedKeyStore for FileKeyStore {
+    /// Read the pin from a fresh copy of the file.
     fn trusted_key(&self, identifier: &str) -> Result<Option<TrustedKey>> {
         Ok(self.load()?.remove(&hash_identifier(identifier)))
     }
 
+    /// Pin `key` inside a locked read-modify-write of the file.
     fn pin_key(&self, identifier: &str, key: TrustedKey) -> Result<()> {
         let id = hash_identifier(identifier);
         self.transact(&mut |keys| {
@@ -328,6 +349,7 @@ impl TrustedKeyStore for FileKeyStore {
         })
     }
 
+    /// Run `decide` and write its result inside one locked file transaction.
     fn update_pin(
         &self,
         identifier: &str,
@@ -529,6 +551,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Counts writes so tests can see whether the pin file would be rewritten.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryKeyStore,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TrustedKeyStore for CountingStore {
+        /// Delegate to the in-memory store.
+        fn trusted_key(&self, identifier: &str) -> Result<Option<TrustedKey>> {
+            self.inner.trusted_key(identifier)
+        }
+        /// Count the write, then delegate.
+        fn pin_key(&self, identifier: &str, key: TrustedKey) -> Result<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.pin_key(identifier, key)
+        }
+    }
+
+    /// Serves one fixed profile.
+    struct Fixed(SignedPaymentProfile);
+
+    #[async_trait]
+    impl ProfileResolver for Fixed {
+        /// Return the fixed profile.
+        async fn resolve_alias(&self, _alias: &str) -> Result<SignedPaymentProfile> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Resolving the same key and sequence again does not rewrite the pin.
+    #[tokio::test]
+    async fn unchanged_pin_is_not_rewritten() {
+        let (pk, sk) = keypair();
+        let signed = sign_profile(profile(ALICE, &pk, 3), &sk).unwrap();
+        let store = Arc::new(CountingStore::default());
+        let resolver = PinnedResolver::new(Fixed(signed), store.clone());
+        for _ in 0..3 {
+            resolver.resolve_alias(ALICE).await.unwrap();
+        }
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Pins persist across reopen and the raw identifier is never written.
