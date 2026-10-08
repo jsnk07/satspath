@@ -375,6 +375,7 @@ mod tests {
         assert!(not_found.is_err());
     }
 
+    /// Start a plain-HTTP loopback test daemon.
     async fn start_test_daemon(
         config: rate_limit::RateLimiterConfig,
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {

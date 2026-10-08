@@ -101,6 +101,7 @@ pub(crate) fn json_result<T: Serialize>(
     }
 }
 
+/// Serialize `body` as a JSON response with `status`.
 pub(crate) fn json_response<T: Serialize>(
     status: StatusCode,
     value: &T,
