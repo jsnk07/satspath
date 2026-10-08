@@ -24,9 +24,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// rejected with a hard error, never passed through.
 pub struct HttpResolver {
     client: Client,
+    /// Lets tests reach a local mock server. Only [`Self::for_local_testing`]
+    /// sets it, so a resolver built with [`Self::new`] never skips SSRF checks,
+    /// even in a build with the `test-utils` feature enabled.
+    allow_loopback_for_tests: bool,
 }
 
 impl HttpResolver {
+    /// A resolver that applies the full SSRF policy to every request.
     pub fn new() -> Self {
         Self {
             client: Client::builder()
@@ -35,6 +40,17 @@ impl HttpResolver {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            allow_loopback_for_tests: false,
+        }
+    }
+
+    /// A resolver that may also fetch from `localhost`/`127.0.0.1`, for tests
+    /// against a local mock server. Not available in normal builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_local_testing() -> Self {
+        Self {
+            allow_loopback_for_tests: true,
+            ..Self::new()
         }
     }
 
@@ -79,14 +95,13 @@ impl HttpResolver {
     /// Extracted so tests can pass a mock server URL directly without
     /// needing a real DNS entry for the test domain.
     pub async fn resolve_from_url(&self, url: &str) -> Result<SignedPaymentProfile> {
-        let is_test_build = cfg!(any(test, feature = "test-utils"));
         let parsed =
             url::Url::parse(url).map_err(|e| SatsPathError::InvalidPaymentUri(e.to_string()))?;
         let is_local = parsed.username().is_empty()
             && parsed.password().is_none()
             && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
 
-        let client = if is_test_build && is_local {
+        let client = if self.allow_loopback_for_tests && is_local {
             if let Some(port) = parsed.port() {
                 if matches!(port, 22 | 3306 | 5432 | 6379 | 27017) {
                     return Err(SatsPathError::ValidationError(format!(
@@ -199,7 +214,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -230,7 +245,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -260,7 +275,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -281,7 +296,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -304,7 +319,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -329,7 +344,7 @@ mod tests {
             .create_async()
             .await;
 
-        let resolver = HttpResolver::new();
+        let resolver = HttpResolver::for_local_testing();
         let url = format!("{}/profile", server.url());
         let result = resolver.resolve_from_url(&url).await;
 
@@ -337,6 +352,19 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), SatsPathError::SerializationError(_)),
             "malformed JSON must map to SerializationError"
+        );
+    }
+
+    /// The default resolver never takes the loopback test path, even in a
+    /// build with `test-utils` enabled.
+    #[tokio::test]
+    async fn default_resolver_refuses_loopback() {
+        let result = HttpResolver::new()
+            .resolve_from_url("https://127.0.0.1:8443/profile")
+            .await;
+        assert!(
+            matches!(result, Err(SatsPathError::ValidationError(_))),
+            "{result:?}"
         );
     }
 }

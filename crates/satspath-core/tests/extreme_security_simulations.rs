@@ -46,7 +46,7 @@ async fn test_attack_memory_exhaustion_dos() {
         .create_async()
         .await;
 
-    let resolver = HttpResolver::new();
+    let resolver = HttpResolver::for_local_testing();
     let url = format!("{}/profile", server.url());
     let result = resolver.resolve_from_url(&url).await;
 

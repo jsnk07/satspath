@@ -6,7 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{client_async_tls, connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{client_async_tls_with_config, connect_async, tungstenite::Message};
 
 use crate::crypto::{check_profile_expiry, verify_signed_profile};
 use crate::peer_registry::canonicalize_identifier;
@@ -21,6 +22,10 @@ const DEFAULT_RELAYS: &[&str] = &[
 ];
 const NOSTR_TIMEOUT: Duration = Duration::from_secs(8);
 const NIP05_TIMEOUT: Duration = Duration::from_secs(6);
+/// Largest NIP-05 document accepted from an (untrusted) identifier's domain.
+const NIP05_MAX_BYTES: usize = 64 * 1024;
+/// Largest relay message accepted; a SatsPath profile event is a few KiB.
+const RELAY_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
 /// Resolver for SatsPath profiles announced over Nostr.
 ///
@@ -80,20 +85,35 @@ impl NostrResolver {
         let (name, domain) = canonical
             .split_once('@')
             .ok_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))?;
-        let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
+        let mut url = url::Url::parse(&format!("https://{domain}/.well-known/nostr.json"))
+            .map_err(|e| SatsPathError::ValidationError(format!("invalid NIP-05 domain: {e}")))?;
+        url.query_pairs_mut().append_pair("name", name);
+        let url = url.to_string();
         // SSRF-02: the domain comes from an untrusted identifier. Resolve it,
         // reject internal addresses, pin the connection, and refuse redirects.
         let target = crate::ssrf::resolve_and_validate(&url, false).await?;
         let client = crate::ssrf::pinned_client(&target, NIP05_TIMEOUT)?;
-        let document: Nip05Document = client
+        let mut resp = client
             .get(&url)
             .send()
             .await
             .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 fetch failed: {e}")))?
             .error_for_status()
-            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?
-            .json()
+            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 HTTP error: {e}")))?;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
+            .map_err(|e| SatsPathError::NetworkError(format!("NIP-05 read failed: {e}")))?
+        {
+            if body.len() + chunk.len() > NIP05_MAX_BYTES {
+                return Err(SatsPathError::NetworkError(format!(
+                    "NIP-05 document exceeds {NIP05_MAX_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let document: Nip05Document = serde_json::from_slice(&body)
             .map_err(|e| SatsPathError::SerializationError(format!("NIP-05 JSON: {e}")))?;
 
         let pubkey = document
@@ -108,23 +128,13 @@ impl NostrResolver {
         if relays.is_empty() {
             relays = self.fallback_relays.clone();
         }
+        // Relay hints come from the untrusted NIP-05 document: keep only TLS
+        // relays whose URL passes the SSRF policy (the address is re-checked
+        // and pinned again at connect time in `query_relay`).
         relays.retain(|relay| {
-            let (http_url, allow_http) = if let Some(stripped) = relay.strip_prefix("wss://") {
-                (format!("https://{stripped}"), false)
-            } else if let Some(stripped) = relay.strip_prefix("ws://") {
-                (format!("http://{stripped}"), true)
-            } else {
-                return false;
-            };
-            #[cfg(not(test))]
-            {
-                crate::ssrf::validate_url(&http_url, allow_http).is_ok()
-            }
-            #[cfg(test)]
-            {
-                let _ = (http_url, allow_http);
-                true
-            }
+            relay_http_url(relay)
+                .and_then(|url| crate::ssrf::validate_url(&url, false))
+                .is_ok()
         });
         relays.truncate(8);
         if relays.is_empty() {
@@ -161,15 +171,14 @@ impl NostrResolver {
             // SSRF-02: relay hints come from the (untrusted) NIP-05 document.
             // Resolve and validate the relay host, then connect the socket to
             // a validated address so DNS cannot be re-pointed in between.
-            let target = crate::ssrf::resolve_and_validate(
-                &relay_http_url(relay)?,
-                relay.starts_with("ws://"),
-            )
-            .await?;
+            let target = crate::ssrf::resolve_and_validate(&relay_http_url(relay)?, false).await?;
             let stream = tokio::net::TcpStream::connect(target.addrs.as_slice())
                 .await
                 .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
-            let (mut ws, _) = client_async_tls(relay, stream)
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(RELAY_MAX_MESSAGE_BYTES))
+                .max_frame_size(Some(RELAY_MAX_MESSAGE_BYTES));
+            let (mut ws, _) = client_async_tls_with_config(relay, stream, Some(config), None)
                 .await
                 .map_err(|e| SatsPathError::NetworkError(format!("Nostr relay connect: {e}")))?;
             ws.send(Message::Text(req.to_string().into()))
@@ -323,16 +332,18 @@ fn event_has_tag(event: &Value, tag_name: &str, tag_value: &str) -> bool {
 
 /// Map a `wss://` / `ws://` relay URL to the equivalent `https://` / `http://`
 /// URL so it can go through the SSRF guard.
+/// The `https://` form of a `wss://` relay URL, for SSRF validation.
+/// Plaintext `ws://` relays are refused: relay hints come from untrusted
+/// NIP-05 documents, and lookups must not leak over unencrypted connections.
 fn relay_http_url(relay: &str) -> Result<String> {
-    if let Some(rest) = relay.strip_prefix("wss://") {
-        Ok(format!("https://{rest}"))
-    } else if let Some(rest) = relay.strip_prefix("ws://") {
-        Ok(format!("http://{rest}"))
-    } else {
-        Err(SatsPathError::ValidationError(format!(
-            "unsupported relay URL scheme: {relay}"
-        )))
-    }
+    relay
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{rest}"))
+        .ok_or_else(|| {
+            SatsPathError::ValidationError(format!(
+                "unsupported relay URL scheme (wss:// required): {relay}"
+            ))
+        })
 }
 
 fn validate_nostr_pubkey(pubkey: &str) -> Result<()> {
@@ -550,5 +561,15 @@ mod tests {
 
         let parsed = signed_profile_from_event(&raw, "sub", nostr_pk, "alice@example.com");
         assert!(parsed.is_err());
+    }
+
+    /// Plaintext and internal relay hints are refused before any connection.
+    #[test]
+    fn relay_hints_require_wss_and_public_host() {
+        assert!(relay_http_url("wss://relay.example.com").is_ok());
+        assert!(relay_http_url("ws://relay.example.com").is_err());
+        assert!(relay_http_url("https://relay.example.com").is_err());
+        let internal = relay_http_url("wss://127.0.0.1:7777").unwrap();
+        assert!(crate::ssrf::validate_url(&internal, false).is_err());
     }
 }
