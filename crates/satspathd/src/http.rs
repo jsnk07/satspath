@@ -20,6 +20,7 @@ pub(crate) struct BodyError {
 }
 
 impl std::fmt::Display for BodyError {
+    /// Show the client-facing error message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.message)
     }
@@ -114,6 +115,7 @@ pub(crate) fn json_response<T: Serialize>(
         .with_header(cors_headers_header())
 }
 
+/// A response with the given status and no body.
 pub(crate) fn empty_response(status: StatusCode) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_data(Vec::new())
         .with_status_code(status)

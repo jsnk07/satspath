@@ -37,6 +37,7 @@ use crate::types::{
 use crate::ui::{html_response, INDEX_HTML};
 use crate::v2_api;
 
+/// Route one HTTP request: rate limit, Host and auth checks, then the handler.
 pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Result<()> {
     let method = request.method().clone();
     let raw_url = request.url().to_string();
