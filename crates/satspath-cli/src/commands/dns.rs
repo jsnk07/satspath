@@ -11,6 +11,7 @@ use satspath_core::bip321::{parse_bip321, Bip321Instruction};
 use satspath_core::bip353::{resolve_bip353_with, DnsTxtResolver, DnssecPolicy, DohTxtResolver};
 use satspath_core::resolvers::bip353::HickoryDnssecTxtResolver;
 
+/// `satspath dns resolve`: print the DNSSEC-validated BIP-353 payment instruction for `name`.
 pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Result<()> {
     let policy = if allow_insecure {
         DnssecPolicy::DevInsecure
@@ -97,6 +98,7 @@ pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Re
     Ok(())
 }
 
+/// One-line human summary of a BIP-321 payment instruction.
 fn describe(instr: &Bip321Instruction) -> String {
     match instr {
         Bip321Instruction::Onchain {

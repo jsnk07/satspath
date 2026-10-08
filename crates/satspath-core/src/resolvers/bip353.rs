@@ -72,6 +72,8 @@ impl Bip353Resolver {
 
 #[async_trait]
 impl ProfileResolver for Bip353Resolver {
+    /// Always refuses `₿` names: a BIP-353 record is a payment instruction,
+    /// not a signed SatsPath profile. Use [`Bip353Resolver::resolve_instruction`].
     async fn resolve_alias(&self, alias: &str) -> Result<SignedPaymentProfile> {
         if !alias.trim_start().starts_with('₿') {
             return Err(SatsPathError::AliasNotFound(alias.to_string()));
@@ -123,6 +125,7 @@ impl HickoryDnssecTxtResolver {
 
 #[async_trait]
 impl DnsTxtResolver for HickoryDnssecTxtResolver {
+    /// Query TXT records for `fqdn` through the DNSSEC-validating resolver.
     async fn query_txt(&self, fqdn: &str) -> Result<Vec<DnsTxtRecord>> {
         let lookup = self
             .resolver
