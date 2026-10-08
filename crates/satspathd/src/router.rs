@@ -25,7 +25,8 @@ use crate::handlers::{
     },
 };
 use crate::http::{
-    empty_response, handle_read_error, json_error, json_response, json_result, read_json,
+    empty_response, handle_read_error, is_loopback_host, json_error, json_response, json_result,
+    read_json,
 };
 use crate::rate_limit;
 use crate::types::{
@@ -40,6 +41,20 @@ pub(crate) async fn handle_request(mut request: Request, state: &AppState) -> Re
     let method = request.method().clone();
     let raw_url = request.url().to_string();
     let path = raw_url.split('?').next().unwrap_or("/").to_string();
+
+    // 0. DNS-rebinding guard: a loopback-bound daemon only answers loopback Host names.
+    // Behind a trusted reverse proxy the public Host is forwarded and the proxy's
+    // server_name matching is what validates it.
+    if state.bind.ip().is_loopback()
+        && !state.rate_limiter.trust_proxy_headers()
+        && !is_loopback_host(&request)
+    {
+        let _ = request.respond(json_error(
+            StatusCode(403),
+            anyhow::anyhow!("Forbidden: Host header must name a loopback address"),
+        ));
+        return Ok(());
+    }
 
     // 1. Guard against oversized request bodies (HTTP 413 Payload Too Large)
     let max_body = state.rate_limiter.max_body_bytes();

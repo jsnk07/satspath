@@ -10,17 +10,84 @@ use crate::types::ErrorResponse;
 
 pub(crate) const MAX_JSON_BODY_BYTES: u64 = 65_536; // 64 KB limit to prevent DoS
 
+/// A request-body rejection that carries its own HTTP status. [`json_error`] uses
+/// this status in place of the route's default, so every JSON route reports
+/// 415/413 for body problems while keeping its own status for handler errors.
+#[derive(Debug)]
+pub(crate) struct BodyError {
+    status: u16,
+    message: &'static str,
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for BodyError {}
+
+/// Read and parse a JSON request body, enforcing Content-Type and size limits.
 pub(crate) fn read_json<T: for<'de> serde::Deserialize<'de>>(request: &mut Request) -> Result<T> {
+    // Browsers send text/plain, form and multipart POSTs cross-origin without a CORS
+    // preflight. Requiring application/json forces a preflight, so a hostile page cannot
+    // drive mutations on a local daemon.
+    if !has_json_content_type(request) {
+        return Err(BodyError {
+            status: 415,
+            message: "unsupported media type: Content-Type must be application/json",
+        }
+        .into());
+    }
     let mut body = String::new();
     let mut reader = request.as_reader().take(MAX_JSON_BODY_BYTES + 1);
     reader.read_to_string(&mut body)?;
     if body.len() as u64 > MAX_JSON_BODY_BYTES {
-        anyhow::bail!("payload too large: maximum allowed request body is 65536 bytes");
+        return Err(BodyError {
+            status: 413,
+            message: "payload too large: maximum allowed request body is 65536 bytes",
+        }
+        .into());
     }
     if body.trim().is_empty() {
         anyhow::bail!("request body must be JSON");
     }
     Ok(serde_json::from_str(&body)?)
+}
+
+/// Whether the request declares `application/json` (parameters such as charset allowed).
+fn has_json_content_type(request: &Request) -> bool {
+    request.headers().iter().any(|h| {
+        h.field.equiv("Content-Type")
+            && h.value
+                .as_str()
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    })
+}
+
+/// Whether a request's Host header names a loopback host. A DNS-rebinding page arrives
+/// with its own domain in Host even though the connection lands on 127.0.0.1.
+pub(crate) fn is_loopback_host(request: &Request) -> bool {
+    let Some(host) = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().trim().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        host.rsplit_once(':')
+            .map_or(host.as_str(), |(name, _)| name)
+    };
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn json_result<T: Serialize>(
@@ -55,10 +122,14 @@ pub(crate) fn empty_response(status: StatusCode) -> Response<std::io::Cursor<Vec
         .with_header(cors_headers_header())
 }
 
+/// JSON error response. A [`BodyError`] overrides `status` with its own.
 pub(crate) fn json_error(
     status: StatusCode,
     error: anyhow::Error,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
+    let status = error
+        .downcast_ref::<BodyError>()
+        .map_or(status, |body| StatusCode(body.status));
     json_response(
         status,
         &ErrorResponse {
@@ -67,12 +138,10 @@ pub(crate) fn json_error(
     )
 }
 
+/// Response for a request body that could not be read: 415/413 for
+/// [`BodyError`]s, 400 for anything else (e.g. malformed JSON).
 pub(crate) fn handle_read_error(e: anyhow::Error) -> Response<std::io::Cursor<Vec<u8>>> {
-    if e.to_string().contains("payload too large") {
-        json_error(StatusCode(413), e)
-    } else {
-        json_error(StatusCode(400), e)
-    }
+    json_error(StatusCode(400), e)
 }
 
 pub(crate) fn json_header() -> Header {
