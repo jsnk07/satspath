@@ -531,6 +531,7 @@ mod tests {
         assert!(!joined.contains("broadcast"));
     }
 
+    /// pay refuses a revoked recipient before any route is selected.
     #[test]
     fn revoked_profile_is_refused_before_routing() {
         let mut profile = satspath_core::PaymentProfile {

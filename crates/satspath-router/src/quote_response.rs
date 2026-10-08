@@ -450,6 +450,7 @@ mod tests {
 
     #[async_trait]
     impl ProfileResolver for MockResolver {
+        /// Fail every lookup with the configured error.
         async fn resolve_alias(&self, alias: &str) -> satspath_core::Result<SignedPaymentProfile> {
             self.signed
                 .clone()
@@ -462,6 +463,7 @@ mod tests {
 
     #[async_trait]
     impl ProfileResolver for RevokedResolver {
+        /// Report every alias as revoked by its owner.
         async fn resolve_alias(&self, alias: &str) -> satspath_core::Result<SignedPaymentProfile> {
             Err(SatsPathError::ProfileRevoked(alias.to_string()))
         }

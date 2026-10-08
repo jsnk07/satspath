@@ -70,6 +70,7 @@ struct FixedResolver(SignedPaymentProfile);
 
 #[async_trait]
 impl ProfileResolver for FixedResolver {
+    /// Return the fixed profile regardless of the alias asked for.
     async fn resolve_alias(&self, _alias: &str) -> Result<SignedPaymentProfile> {
         Ok(self.0.clone())
     }
