@@ -20,6 +20,7 @@ pub(crate) struct BodyError {
 }
 
 impl std::fmt::Display for BodyError {
+    /// Show the client-facing error message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.message)
     }

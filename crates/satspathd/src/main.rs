@@ -397,11 +397,13 @@ mod tests {
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let home = Box::leak(Box::new(dir)).path().to_path_buf();
-        start_test_daemon_at(home, config, ssl_config).await
+        start_test_daemon_at(bind, home, config, ssl_config).await
     }
 
-    /// Start a test daemon serving `home`, so a test can seed state there first.
+    /// Start a test daemon on `bind` serving `home`, so a test can seed state
+    /// there first.
     async fn start_test_daemon_at(
+        bind: &str,
         home: std::path::PathBuf,
         config: rate_limit::RateLimiterConfig,
         ssl_config: Option<tiny_http::SslConfig>,
@@ -511,8 +513,11 @@ mod tests {
         let body = r#"{"recipient":"carol@example.com","amount_sats":1000}"#;
 
         // A text/plain POST is a CORS "simple request" a hostile page can send blind.
+        // /v1/send is owner-only, so authenticate: the Content-Type rule must
+        // hold even for a request that carries the token.
         let res = client
             .post(format!("{base_url}/v1/send"))
+            .bearer_auth("test_token")
             .header("Content-Type", "text/plain")
             .body(body)
             .send()
@@ -522,6 +527,7 @@ mod tests {
 
         let res = client
             .post(format!("{base_url}/v1/send"))
+            .bearer_auth("test_token")
             .header("Content-Type", "application/json; charset=utf-8")
             .body(body)
             .send()
@@ -632,6 +638,7 @@ mod tests {
         }
     }
 
+    /// Claims, invite listings and sends need the admin token over HTTP.
     #[tokio::test]
     async fn test_http_claim_and_invite_listing_require_auth() {
         let config = rate_limit::RateLimiterConfig {
@@ -710,6 +717,7 @@ mod tests {
         server.unblock();
     }
 
+    /// A claim carrying a signed profile passes authentication without the token.
     #[tokio::test]
     async fn test_http_public_claim_with_signed_profile_skips_admin_auth() {
         let dir = tempfile::tempdir().unwrap();
@@ -771,7 +779,8 @@ mod tests {
             trust_proxy_headers: false,
             cleanup_interval_secs: 300,
         };
-        let (base_url, server, _handle) = start_test_daemon_at(home, config, None).await;
+        let (base_url, server, _handle) =
+            start_test_daemon_at("127.0.0.1:0", home, config, None).await;
 
         // No Authorization header: a receiver-signed claim must pass the auth layer
         // and reach the claim handler. (The handler cannot yet commit such a claim:
