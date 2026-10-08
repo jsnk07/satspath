@@ -213,6 +213,31 @@ mod tests {
         assert!(!raw.contains("secret_key"));
     }
 
+    /// A BIP-353 name sent to /v1/send fails closed: NoRoute, and no invite
+    /// is created for an unauthenticated request.
+    #[tokio::test]
+    async fn send_to_bip353_name_is_no_route_not_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = send_response(
+            &test_state(dir.path()),
+            SendRequest {
+                recipient: "₿alice@example.com".into(),
+                amount_sats: 1_000,
+                routing_ok: Some(true),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, SendResponse::NoRoute { ref reason } if reason.contains("BIP-353")),
+            "{response:?}"
+        );
+        let mut invites = satspath_core::InviteStore::open(dir.path()).unwrap();
+        assert!(
+            invites.list().unwrap().is_empty(),
+            "no invite may be created"
+        );
+    }
+
     #[tokio::test]
     async fn quote_rejects_profile_without_transparency() {
         use satspath_core::registry::Registry;

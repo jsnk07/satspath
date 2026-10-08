@@ -8,8 +8,10 @@
 use anyhow::Result;
 
 use satspath_core::bip321::{parse_bip321, Bip321Instruction};
+use satspath_core::bip321_handoff::validate_payment_handoff;
 use satspath_core::bip353::{resolve_bip353_with, DnsTxtResolver, DnssecPolicy, DohTxtResolver};
 use satspath_core::resolvers::bip353::HickoryDnssecTxtResolver;
+use satspath_core::BitcoinNetwork;
 
 /// `satspath dns resolve`: print the DNSSEC-validated BIP-353 payment instruction for `name`.
 pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Result<()> {
@@ -27,7 +29,15 @@ pub async fn cmd_dns_resolve(name: &str, json: bool, allow_insecure: bool) -> Re
         Box::new(HickoryDnssecTxtResolver::new())
     };
     let now = chrono::Utc::now().timestamp();
-    let result = resolve_bip353_with(resolver.as_ref(), name, policy, now).await;
+    // DNSSEC only proves who published the URI. Validate its contents (mainnet
+    // addresses, invoices, offers, amount) before displaying anything.
+    let result = resolve_bip353_with(resolver.as_ref(), name, policy, now)
+        .await
+        .and_then(|resolution| {
+            let parsed = parse_bip321(&resolution.bitcoin_uri)?;
+            validate_payment_handoff(&parsed, BitcoinNetwork::Mainnet, None)?;
+            Ok(resolution)
+        });
 
     if json {
         // JSON mode prints ONLY JSON — success or a structured error object.

@@ -112,6 +112,7 @@ pub struct HickoryDnssecTxtResolver {
 }
 
 impl Default for HickoryDnssecTxtResolver {
+    /// Same as [`HickoryDnssecTxtResolver::new`].
     fn default() -> Self {
         Self::new()
     }

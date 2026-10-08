@@ -69,7 +69,12 @@ pub async fn cmd_pay(
     // instruction, not to a SatsPath profile signed by an identity key. They
     // get their own path so they are never presented as a verified signature.
     if alias.trim_start().starts_with('₿') {
-        return pay_bip353(alias, amount_sats, debug).await;
+        let network = if testnet {
+            BitcoinNetwork::Testnet
+        } else {
+            BitcoinNetwork::Mainnet
+        };
+        return pay_bip353(alias, amount_sats, network, debug).await;
     }
 
     let display_alias = if debug {
@@ -182,7 +187,12 @@ pub async fn cmd_pay(
 /// The instruction is authenticated by DNSSEC (Strict policy: an unvalidated
 /// record fails closed). It is NOT signed by a SatsPath identity key, and this
 /// output says so explicitly.
-async fn pay_bip353(name: &str, amount_sats: u64, debug: bool) -> Result<()> {
+async fn pay_bip353(
+    name: &str,
+    amount_sats: u64,
+    network: BitcoinNetwork,
+    debug: bool,
+) -> Result<()> {
     let display_name = if debug {
         name.to_string()
     } else {
@@ -194,6 +204,20 @@ async fn pay_bip353(name: &str, amount_sats: u64, debug: bool) -> Result<()> {
         .resolve_instruction(name)
         .await
         .map_err(|e| anyhow::anyhow!("BIP-353 resolution failed (fail closed): {}", e))?;
+
+    // DNSSEC proves who published the URI, not that its contents are payable:
+    // check address/network, invoice, offer and amount before showing it.
+    satspath_core::parse_bip321(&resolution.bitcoin_uri)
+        .and_then(|parsed| {
+            satspath_core::bip321_handoff::validate_payment_handoff(
+                &parsed,
+                network,
+                Some(amount_sats),
+            )
+        })
+        .map_err(|e| {
+            anyhow::anyhow!("BIP-353 payment instruction rejected (fail closed): {}", e)
+        })?;
 
     println!("  DNSSEC: validated.");
     println!("  Identity: NOT a SatsPath-signed profile.");

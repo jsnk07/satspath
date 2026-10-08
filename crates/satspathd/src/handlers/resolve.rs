@@ -3,11 +3,13 @@
 use anyhow::Result;
 use satspath_core::{
     bip321::parse_bip321,
-    bip353::{resolve_bip353_with, DnssecPolicy, DohTxtResolver},
+    bip321_handoff::validate_payment_handoff,
+    bip353::{resolve_bip353_with, DnsTxtResolver, DnssecPolicy, DohTxtResolver},
     crypto::verify_signed_profile,
     resolver::ChainResolver,
+    resolvers::bip353::HickoryDnssecTxtResolver,
     resolvers::{bip353::Bip353Resolver, http::HttpResolver, nostr::NostrResolver},
-    CheckpointStore, ResolvedTransparentProfile, ResolverSource, SatsPathError,
+    BitcoinNetwork, CheckpointStore, ResolvedTransparentProfile, ResolverSource, SatsPathError,
     TransactionalTransparencyStore, VerificationStates,
 };
 
@@ -191,9 +193,17 @@ pub(crate) async fn dns_resolve_response(body: DnsResolveRequest) -> DnsResolveR
     } else {
         DnssecPolicy::Strict
     };
-    let resolver = DohTxtResolver::new();
-    match resolve_bip353_with(&resolver, &body.name, policy, now()).await {
-        Ok(resolution) => match parse_bip321(&resolution.bitcoin_uri) {
+    // Strict mode needs local DNSSEC validation; the DoH backend cannot
+    // validate and is only used in the insecure dev mode.
+    let resolver: Box<dyn DnsTxtResolver + Send + Sync> = if body.allow_insecure_dns_for_dev {
+        Box::new(DohTxtResolver::new())
+    } else {
+        Box::new(HickoryDnssecTxtResolver::new())
+    };
+    match resolve_bip353_with(resolver.as_ref(), &body.name, policy, now()).await {
+        Ok(resolution) => match parse_bip321(&resolution.bitcoin_uri).and_then(|parsed| {
+            validate_payment_handoff(&parsed, BitcoinNetwork::Mainnet, None).map(|_| parsed)
+        }) {
             Ok(parsed) => DnsResolveResponse::Ok { resolution, parsed },
             Err(e) => DnsResolveResponse::Error {
                 name: body.name,

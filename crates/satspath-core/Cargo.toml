@@ -20,6 +20,7 @@ std = [
     "url",
     "hickory-resolver",
     "rusqlite",
+    "lightning-invoice",
 ]
 wasm = [
     "web-sys/Request",
@@ -46,6 +47,7 @@ canonical_json = "0.5"
 bech32 = "0.9"
 hmac = "0.12"
 satspath-pqc = { path = "../satspath-pqc" }
+lightning-invoice = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
 
 # Optional dependencies (enabled by default/std feature)

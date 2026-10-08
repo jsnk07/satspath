@@ -1,5 +1,7 @@
 pub mod ark;
 pub mod bip321;
+#[cfg(feature = "std")]
+pub mod bip321_handoff;
 pub mod bip353;
 pub mod bip353_publish;
 pub mod codec;

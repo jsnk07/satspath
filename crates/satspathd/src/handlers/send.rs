@@ -4,7 +4,7 @@ use anyhow::Result;
 use satspath_core::{
     privacy::mask_identifier,
     validation::{assert_no_private_material, validate_amount_sats},
-    PaymentMethod, ProfileResolver,
+    PaymentMethod, ProfileResolver, SatsPathError,
 };
 use satspath_router::{fees::fetch_fee_estimate, select_priority_route};
 
@@ -107,7 +107,9 @@ pub(crate) fn receive_payload_for(method: &PaymentMethod) -> Result<String> {
 }
 
 /// Resolve the recipient, pick a rail by priority, and return the best QR.
-/// If the recipient is not registered, return an EXPERIMENTAL email invite.
+/// Only a recipient that is genuinely not registered gets an EXPERIMENTAL email
+/// invite; any other resolution failure (BIP-353 name, verification error)
+/// fails closed with `NoRoute` and creates no invite.
 pub(crate) async fn send_response(state: &AppState, body: SendRequest) -> SendResponse {
     if let Err(e) = validate_amount_sats(body.amount_sats) {
         return SendResponse::NoRoute {
@@ -170,6 +172,14 @@ pub(crate) async fn send_response(state: &AppState, body: SendRequest) -> SendRe
                 },
             }
         }
+        Err(SatsPathError::Bip353(_)) => SendResponse::NoRoute {
+            reason: "BIP-353 names resolve to DNS payment instructions, not SatsPath \
+                     profiles; resolve them with `satspath dns resolve`."
+                .to_string(),
+        },
+        Err(e) if !matches!(e, SatsPathError::AliasNotFound(_)) => SendResponse::NoRoute {
+            reason: "recipient could not be resolved safely; no invite was created".to_string(),
+        },
         Err(_) => {
             let secret_opt = load_wallet(&state.home).ok().and_then(|w| {
                 w.identity_pubkey.and_then(|pk| {

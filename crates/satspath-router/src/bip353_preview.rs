@@ -30,6 +30,16 @@ pub fn quote_from_bip353_resolution(
             }
         }
     };
+    // Fail closed on malformed, cross-network or amount-mismatched payloads.
+    if let Err(e) = satspath_core::bip321_handoff::validate_payment_handoff(
+        &parsed,
+        BitcoinNetwork::Mainnet,
+        Some(amount_sats),
+    ) {
+        return QuoteResponse::NoRoute {
+            reason: format!("BIP-353 payment instruction rejected: {e}"),
+        };
+    }
 
     let recipient = QuoteRecipient {
         alias: resolution.name.display.clone(),
@@ -125,6 +135,10 @@ mod tests {
         resolve_bip353_with, Bip353Name, DnsTxtRecord, DnssecPolicy, MockDnsTxtResolver,
     };
 
+    /// BIP-353 URI carrying the BOLT12 specification's test-vector offer.
+    const BIP353_OFFER_URI: &str = "bitcoin:?lno=lno1pgx9getnwss8vetrw3hhyuckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg";
+
+    /// A BIP-353 resolution of `uri` through a mock DNS backend.
     fn resolution(uri: &str, dnssec: bool) -> Bip353Resolution {
         let mut resolver = MockDnsTxtResolver::new();
         let name = Bip353Name {
@@ -160,7 +174,7 @@ mod tests {
 
     #[test]
     fn bip353_bolt12_maps_to_ok_quote() {
-        let res = resolution("bitcoin:?lno=lno1qoffer", true);
+        let res = resolution(BIP353_OFFER_URI, true);
         let quote = quote_from_bip353_resolution(&res, 1000);
         match quote {
             QuoteResponse::Ok {
@@ -179,7 +193,7 @@ mod tests {
                         ..
                     }
                 ));
-                assert_eq!(qr, "bitcoin:?lno=lno1qoffer");
+                assert_eq!(qr, BIP353_OFFER_URI);
             }
             other => panic!("expected Ok, got {}", other.status()),
         }
@@ -187,7 +201,10 @@ mod tests {
 
     #[test]
     fn bip353_onchain_maps_to_onchain_method() {
-        let res = resolution("bitcoin:bc1qaddr?amount=0.00001000", true);
+        let res = resolution(
+            "bitcoin:bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq?amount=0.00001000",
+            true,
+        );
         let quote = quote_from_bip353_resolution(&res, 1000);
         match quote {
             QuoteResponse::Ok {
@@ -196,7 +213,10 @@ mod tests {
                 ..
             } => {
                 assert!(matches!(selected_method, PaymentMethod::Onchain { .. }));
-                assert_eq!(qr, "bitcoin:bc1qaddr?amount=0.00001000");
+                assert_eq!(
+                    qr,
+                    "bitcoin:bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq?amount=0.00001000"
+                );
             }
             other => panic!("expected Ok, got {}", other.status()),
         }
@@ -204,7 +224,7 @@ mod tests {
 
     #[test]
     fn bip353_unvalidated_dnssec_marks_recipient_unverified() {
-        let res = resolution("bitcoin:?lno=lno1qoffer", false);
+        let res = resolution(BIP353_OFFER_URI, false);
         let quote = quote_from_bip353_resolution(&res, 1000);
         if let QuoteResponse::Ok { recipient, .. } = quote {
             assert!(!recipient.verified);

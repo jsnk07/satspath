@@ -64,36 +64,75 @@ pub fn validate_lightning_address(address: &str) -> Result<()> {
 }
 
 /// Validate a BOLT12 offer string.
-/// BOLT12 offers are bech32 encoded with prefix "lno" (mainnet) or "lnot" (testnet).
-/// They contain an amount, node_id, paths, and other metadata.
+///
+/// BOLT12 offers use the bech32 character set with the `lno` prefix but,
+/// unlike BIP-173, carry **no checksum**, and may be split with `+` (optionally
+/// followed by whitespace). A checksum-verifying bech32 decoder therefore
+/// rejects every real offer; this decodes them as the BOLT12 spec defines.
 pub fn validate_bolt12_offer(offer: &str) -> Result<()> {
+    let invalid = |msg: &str| SatsPathError::InvalidPaymentPointer(format!("BOLT12 offer {msg}"));
     let trimmed = offer.trim();
     if trimmed.is_empty() {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer cannot be empty".into(),
-        ));
+        return Err(invalid("cannot be empty"));
     }
-    let lower = trimmed.to_ascii_lowercase();
-    // BOLT12 offers use bech32 with prefixes lno (mainnet) or lnot (testnet)
-    if !lower.starts_with("lno") && !lower.starts_with("lnot") {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer must start with 'lno' (mainnet) or 'lnot' (testnet)".into(),
-        ));
+    let bytes = decode_bolt12_bech32(trimmed, "lno").map_err(|e| invalid(&e))?;
+    // A real offer always carries substantial TLV data (at least a node id or
+    // blinded path): reject payloads that are truncated, synthetic or a prefix.
+    if bytes.len() < 25 {
+        return Err(invalid("data too short -- likely truncated or invalid"));
     }
-    // Decode and validate the bech32 payload
-    let (_, data, _) = bech32::decode(&lower).map_err(|e| {
-        SatsPathError::InvalidPaymentPointer(format!("BOLT12 offer bech32 decode failed: {e}"))
-    })?;
-    // A real BOLT12 offer always has substantial TLV data -- reject suspiciously
-    // short payloads that are likely truncated, synthetic, or just a prefix.
-    if data.len() < 40 {
-        return Err(SatsPathError::InvalidPaymentPointer(
-            "BOLT12 offer data too short -- likely truncated or invalid".into(),
-        ));
-    }
-    // Ensure no private material
     assert_no_private_material(trimmed)?;
     Ok(())
+}
+
+/// Decode a checksum-less BOLT12 bech32 string with human-readable part `hrp`.
+fn decode_bolt12_bech32(s: &str, hrp: &str) -> std::result::Result<Vec<u8>, String> {
+    const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    // `+` joins parts; whitespace is only allowed directly after a `+`.
+    let mut joined = String::with_capacity(s.len());
+    let mut after_plus = false;
+    for c in s.chars() {
+        match c {
+            '+' => after_plus = true,
+            c if c.is_whitespace() && after_plus => {}
+            c if c.is_whitespace() => return Err("contains whitespace".into()),
+            c => {
+                after_plus = false;
+                joined.push(c);
+            }
+        }
+    }
+    if joined.chars().any(|c| c.is_ascii_uppercase())
+        && joined.chars().any(|c| c.is_ascii_lowercase())
+    {
+        return Err("mixes upper and lower case".into());
+    }
+    let joined = joined.to_ascii_lowercase();
+    let (prefix, data) = joined
+        .rsplit_once('1')
+        .ok_or_else(|| "has no bech32 separator".to_string())?;
+    if prefix != hrp {
+        return Err(format!("must start with '{hrp}1'"));
+    }
+    let mut out = Vec::with_capacity(data.len() * 5 / 8);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in data.bytes() {
+        let value = CHARSET
+            .iter()
+            .position(|&x| x == c)
+            .ok_or_else(|| format!("contains invalid character '{}'", c as char))?;
+        acc = (acc << 5) | value as u32;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    if bits >= 5 || acc != 0 {
+        return Err("has invalid padding".into());
+    }
+    Ok(out)
 }
 
 pub fn validate_bitcoin_address(address: &str, network: BitcoinNetwork) -> Result<()> {
