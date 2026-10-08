@@ -387,6 +387,15 @@ mod tests {
     ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let home = Box::leak(Box::new(dir)).path().to_path_buf();
+        start_test_daemon_at(home, config, ssl_config).await
+    }
+
+    /// Start a test daemon serving `home`, so a test can seed state there first.
+    async fn start_test_daemon_at(
+        home: std::path::PathBuf,
+        config: rate_limit::RateLimiterConfig,
+        ssl_config: Option<tiny_http::SslConfig>,
+    ) -> (String, Arc<Server>, tokio::task::JoinHandle<()>) {
         let (server, scheme) = if let Some(ssl) = ssl_config {
             let srv = Server::https("127.0.0.1:0", ssl).unwrap();
             (Arc::new(srv), "https")
@@ -532,6 +541,96 @@ mod tests {
         }
 
         server.unblock();
+    }
+
+    #[tokio::test]
+    async fn test_http_public_claim_with_signed_profile_skips_admin_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        load_or_create_identity(&home).unwrap();
+
+        // Sender creates an invite for an unregistered alias.
+        let claim_url = match send_response(
+            &test_state(&home),
+            SendRequest {
+                recipient: "carol@example.com".into(),
+                amount_sats: 25_000,
+                routing_ok: Some(true),
+            },
+        )
+        .await
+        {
+            SendResponse::Invite { claim_url, .. } => claim_url,
+            other => panic!("expected SendResponse::Invite, got {other:?}"),
+        };
+        let invite_id = claim_url
+            .split("invite_id=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Receiver signs their own profile with their own key.
+        let key = generate_identity_keypair();
+        let profile = PaymentProfile {
+            alias: "carol@example.com".into(),
+            identity_pubkey: hex::encode(key.public_key.serialize()),
+            methods: vec![PaymentMethod::Lightning {
+                label: "LN".into(),
+                lightning_address: Some("carol@getalby.com".into()),
+                lnurl: None,
+                bolt12: None,
+                receiver_pubkey: None,
+            }],
+            updated_at: chrono::Utc::now().timestamp(),
+            expires_at: None,
+            sequence: Some(0),
+            preferences: vec![],
+            nonce: None,
+            rotation: None,
+            method_verifications: vec![],
+            hybrid_pubkey: None,
+            pqc_required: false,
+            revoked: false,
+        };
+        let signed = sign_profile(profile, &key.secret_key).unwrap();
+
+        let config = rate_limit::RateLimiterConfig {
+            burst_capacity: 50,
+            refill_rate_per_sec: 50.0,
+            max_body_bytes: 65_536,
+            trust_proxy_headers: false,
+            cleanup_interval_secs: 300,
+        };
+        let (base_url, server, _handle) = start_test_daemon_at(home, config, None).await;
+
+        // No Authorization header: a receiver-signed claim must pass the auth layer
+        // and reach the claim handler. (The handler cannot yet commit such a claim:
+        // the transparency event needs the receiver's signature over the event
+        // itself, which this API does not collect. That is tracked separately.)
+        let res = reqwest::Client::new()
+            .post(format!("{base_url}/v1/claim"))
+            .json(&serde_json::json!({
+                "invite_id": invite_id,
+                "alias": "carol@example.com",
+                "signed_profile": signed,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let body: serde_json::Value = res.json().await.unwrap();
+        server.unblock();
+        assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED, "{body}");
+        assert!(
+            !body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unauthorized"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

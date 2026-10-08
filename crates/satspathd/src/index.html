@@ -672,6 +672,17 @@
   const hide = (el) => { el.classList.add("hidden"); el.classList.remove("show"); };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+  // Owner-only endpoints need the daemon's admin token as a Bearer header. It is
+  // kept in sessionStorage (this tab only) and never sent to any other origin.
+  const ADMIN_TOKEN_KEY = "satspathd-admin-token";
+  const adminToken = () => { try { return sessionStorage.getItem(ADMIN_TOKEN_KEY) || ""; } catch (_) { return ""; } };
+  const setAdminToken = (t) => { try { sessionStorage.setItem(ADMIN_TOKEN_KEY, t); } catch (_) {} };
+  const adminFetch = (url, opts = {}) => {
+    const token = adminToken();
+    const headers = Object.assign({}, opts.headers || {}, token ? {Authorization: "Bearer " + token} : {});
+    return fetch(url, Object.assign({}, opts, {headers}));
+  };
+
   const fireLasers = (colorClass) => {
     const container = $("lasers-container");
     for(let i=0; i<6; i++) {
@@ -995,7 +1006,21 @@
   const loadNotifications = async () => {
     try {
       const box = $("s-notifications");
-      const r = await fetch("/v1/invites/notifications");
+      const r = await adminFetch("/v1/invites/notifications");
+      if (r.status === 401) {
+        box.innerHTML = `
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <span>Enter the daemon admin token to see invite notifications.</span>
+            <input id="s-admin-token" type="password" autocomplete="off" placeholder="SATSPATHD_AUTH_TOKEN" style="flex:1; min-width:180px;">
+            <button class="action" id="s-admin-token-save" style="width:auto; padding:6px 14px; margin:0; font-size:12px;">Unlock</button>
+          </div>`;
+        $("s-admin-token-save").onclick = () => {
+          setAdminToken($("s-admin-token").value.trim());
+          loadNotifications();
+        };
+        show(box);
+        return;
+      }
       if (!r.ok) return;
       const notes = await r.json();
       const unread = notes.filter(n => !n.read);
@@ -1025,7 +1050,7 @@
 
   window.fillSend = async (recipient, amount, notificationId) => {
     if (notificationId) {
-      fetch("/v1/invites/notifications/" + encodeURIComponent(notificationId) + "/read", {method: "POST"}).catch(()=>{});
+      adminFetch("/v1/invites/notifications/" + encodeURIComponent(notificationId) + "/read", {method: "POST"}).catch(()=>{});
     }
     $("s-recipient").value = recipient;
     $("s-amount").value = amount;
@@ -1034,7 +1059,7 @@
   };
 
   window.dismissNotification = async (notificationId) => {
-    await fetch("/v1/invites/notifications/" + encodeURIComponent(notificationId) + "/read", {method: "POST"}).catch(()=>{});
+    await adminFetch("/v1/invites/notifications/" + encodeURIComponent(notificationId) + "/read", {method: "POST"}).catch(()=>{});
     loadNotifications();
   };
 
@@ -1113,7 +1138,8 @@
         ark_server: ark || undefined,
       };
 
-      const r = await fetch("/v1/claim", {
+      // This claim publishes the daemon's own identity, so it is owner-only.
+      const r = await adminFetch("/v1/claim", {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify(body)
