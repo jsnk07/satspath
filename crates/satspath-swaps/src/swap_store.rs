@@ -114,12 +114,14 @@ impl SwapStore {
             ));
         };
 
+        reject_legacy_spending_keys(&json_bytes, &self.path)?;
         serde_json::from_slice(&json_bytes)
             .map_err(|e| SwapError::StorageCorruption(format!("Failed to parse swap store: {e}")))
     }
 
     // ── Write ────────────────────────────────────────────────────────────────
 
+    /// Write the whole store, encrypted unless in explicit plaintext dev mode.
     fn save_all(&self, store: &SwapStoreFile) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
@@ -146,11 +148,9 @@ impl SwapStore {
     // ── Sensitive material guard ──────────────────────────────────────────────
 
     /// Returns true if the record contains secrets that must not be stored in
-    /// plaintext: the preimage, or a legacy refund/claim key.
+    /// plaintext: the preimage. (Swap spending keys are never stored at all.)
     pub fn contains_sensitive_material(record: &SwapRecord) -> bool {
         record.preimage_hex.is_some()
-            || record.legacy_refund_key_hex.is_some()
-            || record.legacy_claim_key_hex.is_some()
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -245,6 +245,32 @@ impl SwapStore {
     }
 }
 
+/// Refuse a store written by SatsPath versions that generated and kept swap
+/// spending keys (`refund_key_hex` / `claim_key_hex`).
+///
+/// SatsPath no longer holds spending keys, so it will not load, use or re-save
+/// them. It also does not silently drop them: that would strand any swap that
+/// still needs one of those keys. The file is left untouched, and the error
+/// says how to recover.
+fn reject_legacy_spending_keys(json: &[u8], path: &std::path::Path) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|e| SwapError::StorageCorruption(format!("Failed to parse swap store: {e}")))?;
+    let has_keys = value
+        .get("swaps")
+        .and_then(|s| s.as_array())
+        .is_some_and(|swaps| {
+            swaps.iter().any(|swap| {
+                ["refund_key_hex", "claim_key_hex"]
+                    .iter()
+                    .any(|k| swap.get(*k).is_some_and(|v| !v.is_null()))
+            })
+        });
+    if has_keys {
+        return Err(SwapError::LegacySpendingKeys(path.display().to_string()));
+    }
+    Ok(())
+}
+
 // ─── Encryption helpers (AES-256-GCM) ────────────────────────────────────────
 
 /// Encrypt plaintext bytes with AES-256-GCM.
@@ -280,6 +306,7 @@ fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
 
 // ─── Platform helpers ─────────────────────────────────────────────────────────
 
+/// The local SatsPath state directory.
 fn satspath_dir() -> Result<PathBuf> {
     // Prefer $SATSPATH_DIR env var, then current directory's .satspath
     if let Ok(dir) = std::env::var("SATSPATH_DIR") {
@@ -304,8 +331,6 @@ mod tests {
             preimage_hash_hex: None,
             refund_pubkey_hex: None,
             claim_pubkey_hex: None,
-            legacy_refund_key_hex: None,
-            legacy_claim_key_hex: None,
             invoice: Some("lnbc10u1...".into()),
             lockup_address: Some("bc1q...".into()),
             expected_amount_sats: Some(10_100),
@@ -426,6 +451,7 @@ mod tests {
         );
     }
 
+    /// A plaintext store refuses records carrying a preimage.
     #[test]
     fn swapstore_refuses_sensitive_plaintext_records() {
         let dir = tempdir().unwrap();
@@ -447,16 +473,6 @@ mod tests {
             "expected sensitive-material error, got: {err}"
         );
 
-        // Record with refund_key_hex must be rejected without encryption key.
-        let mut with_refund = make_record("swap_refund");
-        with_refund.legacy_refund_key_hex = Some("cafebabe".repeat(8));
-        assert!(store.upsert(&with_refund).is_err());
-
-        // Record with claim_key_hex must be rejected without encryption key.
-        let mut with_claim = make_record("swap_claim");
-        with_claim.legacy_claim_key_hex = Some("aabbccdd".repeat(8));
-        assert!(store.upsert(&with_claim).is_err());
-
         // Same record with an encryption key must succeed.
         let key = [0x77u8; 32];
         let encrypted_store = SwapStore::open_with_key_at(dir.path().join("swaps_enc.enc"), key);
@@ -468,6 +484,7 @@ mod tests {
         );
     }
 
+    /// Only the preimage counts as sensitive material in a record.
     #[test]
     fn contains_sensitive_material_detects_fields() {
         let clean = make_record("x");
@@ -476,13 +493,22 @@ mod tests {
         let mut with_pre = make_record("x");
         with_pre.preimage_hex = Some("aaa".into());
         assert!(SwapStore::contains_sensitive_material(&with_pre));
+    }
 
-        let mut with_refund = make_record("x");
-        with_refund.legacy_refund_key_hex = Some("bbb".into());
-        assert!(SwapStore::contains_sensitive_material(&with_refund));
+    /// A store holding spending keys from an older version is refused, and the
+    /// file is left exactly as it was (no key is used, re-saved or dropped).
+    #[test]
+    fn store_with_legacy_spending_keys_is_refused_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swaps.json");
+        let legacy = r#"{"swaps":[{"id":"old","kind":"reverse","status":"transaction.confirmed",
+            "amount_sats":1,"claim_key_hex":"aa","refund_key_hex":"bb","created_at":0,"updated_at":0}]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let store = SwapStore::open_plaintext(path.clone());
 
-        let mut with_claim = make_record("x");
-        with_claim.legacy_claim_key_hex = Some("ccc".into());
-        assert!(SwapStore::contains_sensitive_material(&with_claim));
+        let err = store.list_all().unwrap_err();
+        assert!(matches!(err, SwapError::LegacySpendingKeys(_)), "{err}");
+        assert!(store.upsert(&make_record("new")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
     }
 }

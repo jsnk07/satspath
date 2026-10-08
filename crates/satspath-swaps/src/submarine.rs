@@ -86,8 +86,6 @@ pub async fn create_submarine(
         preimage_hash_hex: None,
         refund_pubkey_hex: Some(refund_pubkey_hex),
         claim_pubkey_hex: None,
-        legacy_refund_key_hex: None,
-        legacy_claim_key_hex: None,
         invoice: Some(params.invoice),
         lockup_address: Some(resp.address.clone()),
         expected_amount_sats: Some(resp.expected_amount),

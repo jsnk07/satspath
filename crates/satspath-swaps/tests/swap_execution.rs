@@ -2,6 +2,7 @@ use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::{Address, Network, ScriptBuf};
 use chrono::Utc;
 
+use bitcoin::hashes::{hash160, sha256, Hash};
 use satspath_core::execution::{ExecutionGatePolicy, MockWalletExecutor, WalletExecutor};
 use satspath_core::BitcoinNetwork;
 use satspath_swaps::execution_gate::{
@@ -10,9 +11,11 @@ use satspath_swaps::execution_gate::{
 use satspath_swaps::tx_builder::{
     build_reverse_claim_tx, build_submarine_refund_tx, claim_params_from_record,
     finalize_reverse_claim, finalize_submarine_refund, refund_params_from_record,
+    reverse_htlc_script, submarine_htlc_script, HtlcTerms,
 };
 use satspath_swaps::types::{SwapKind, SwapRecord, SwapStatus};
 
+/// Testnet P2WSH address committing to the script.
 fn p2wsh_address(script_bytes: &[u8]) -> String {
     Address::p2wsh(
         &ScriptBuf::from_bytes(script_bytes.to_vec()),
@@ -21,6 +24,7 @@ fn p2wsh_address(script_bytes: &[u8]) -> String {
     .to_string()
 }
 
+/// A minimal swap record of the given kind and status.
 fn record(kind: SwapKind, status: SwapStatus) -> SwapRecord {
     SwapRecord {
         id: format!("test-{kind:?}"),
@@ -34,8 +38,6 @@ fn record(kind: SwapKind, status: SwapStatus) -> SwapRecord {
         lockup_address: None,
         refund_pubkey_hex: None,
         claim_pubkey_hex: None,
-        legacy_refund_key_hex: None,
-        legacy_claim_key_hex: None,
         invoice: None,
         expected_amount_sats: None,
         timeout_block_height: None,
@@ -56,31 +58,58 @@ fn host_wallet_sign(sighash_hex: &str, secret: &bitcoin::secp256k1::SecretKey) -
     out
 }
 
+/// A host-wallet key pair and a Boltz public key for HTLC fixtures.
+fn keys() -> (bitcoin::secp256k1::SecretKey, [u8; 33], [u8; 33]) {
+    let secp = Secp256k1::new();
+    let (wallet_key, wallet_pub) = secp.generate_keypair(&mut rand::thread_rng());
+    let (_, boltz_pub) = secp.generate_keypair(&mut rand::thread_rng());
+    (wallet_key, wallet_pub.serialize(), boltz_pub.serialize())
+}
+
+/// Claims a reverse swap from its record. The sighash commits to the lockup
+/// value observed on-chain (48,500 sats), not the invoice amount (50,000).
 #[test]
 fn test_reverse_swap_claim_tx_from_record() {
     let preimage = [42u8; 32];
-    let script_bytes = vec![0x63, 0x52, 0x67, 0x00, 0x68];
+    let (wallet_key, wallet_pub, boltz_pub) = keys();
+    let script = reverse_htlc_script(&HtlcTerms {
+        payment_hash160: hash160::Hash::hash(&preimage).to_byte_array(),
+        claim_pubkey: wallet_pub,
+        refund_pubkey: boltz_pub,
+        timeout_block_height: 900_000,
+    });
+    let script_bytes = script.as_bytes().to_vec();
 
     let mut rec = record(SwapKind::Reverse, SwapStatus::TransactionConfirmed);
     rec.preimage_hex = Some(hex::encode(preimage));
+    rec.claim_pubkey_hex = Some(hex::encode(wallet_pub));
+    rec.timeout_block_height = Some(900_000);
     rec.lockup_address = Some(p2wsh_address(&script_bytes));
     rec.expected_amount_sats = Some(50_000);
     rec.redeem_script = Some(hex::encode(&script_bytes));
 
     let dest_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     let lockup_txid = "1111111111111111111111111111111111111111111111111111111111111111";
-    let params =
-        claim_params_from_record(&rec, lockup_txid, 0, dest_addr).expect("claim params extraction");
+    let params = claim_params_from_record(&rec, lockup_txid, 0, 48_500, dest_addr)
+        .expect("claim params extraction");
     assert_eq!(params.destination_address, dest_addr);
-    assert_eq!(params.lockup_amount_sats, 50_000);
+    assert_eq!(params.lockup_amount_sats, 48_500);
     assert_eq!(params.miner_fee_sats, 1000);
 
     let unsigned = build_reverse_claim_tx(params).expect("claim tx building");
-    assert_eq!(unsigned.output_amount_sats, 49_000);
+    assert_eq!(unsigned.output_amount_sats, 47_500);
+    assert_eq!(
+        unsigned.psbt.inputs[0]
+            .witness_utxo
+            .as_ref()
+            .unwrap()
+            .value
+            .to_sat(),
+        48_500
+    );
     assert!(!unsigned.psbt_base64.is_empty());
     assert!(unsigned.psbt.unsigned_tx.input[0].witness.is_empty());
 
-    let (wallet_key, _) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
     let sig = host_wallet_sign(&unsigned.sighash_hex, &wallet_key);
     let tx = finalize_reverse_claim(&unsigned, &sig, &hex::encode(preimage)).expect("finalize");
 
@@ -91,12 +120,23 @@ fn test_reverse_swap_claim_tx_from_record() {
     assert_eq!(witness.iter().nth(1).unwrap(), &preimage[..]);
 }
 
+/// Refunds an expired submarine swap from its record.
 #[test]
 fn test_submarine_swap_refund_tx_from_record() {
-    let script_bytes = vec![0x63, 0x52, 0x67, 0x01, 0x68];
+    let payment_hash = sha256::Hash::hash(&[7u8; 32]).to_byte_array();
+    let (wallet_key, wallet_pub, boltz_pub) = keys();
+    let script = submarine_htlc_script(&HtlcTerms {
+        payment_hash160: bitcoin::hashes::ripemd160::Hash::hash(&payment_hash).to_byte_array(),
+        claim_pubkey: boltz_pub,
+        refund_pubkey: wallet_pub,
+        timeout_block_height: 800_000,
+    });
+    let script_bytes = script.as_bytes().to_vec();
 
     let mut rec = record(SwapKind::Submarine, SwapStatus::InvoiceFailedToPay);
     rec.amount_sats = 100_000;
+    rec.refund_pubkey_hex = Some(hex::encode(wallet_pub));
+    rec.preimage_hash_hex = Some(hex::encode(payment_hash));
     rec.lockup_address = Some(p2wsh_address(&script_bytes));
     rec.expected_amount_sats = Some(100_000);
     rec.timeout_block_height = Some(800_000);
@@ -104,7 +144,7 @@ fn test_submarine_swap_refund_tx_from_record() {
 
     let refund_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     let lockup_txid = "2222222222222222222222222222222222222222222222222222222222222222";
-    let params = refund_params_from_record(&rec, lockup_txid, 1, refund_addr)
+    let params = refund_params_from_record(&rec, lockup_txid, 1, 100_000, refund_addr)
         .expect("refund params extraction");
     assert_eq!(params.lockup_amount_sats, 100_000);
     assert_eq!(params.timeout_block_height, 800_000);
@@ -116,7 +156,6 @@ fn test_submarine_swap_refund_tx_from_record() {
         800_000
     );
 
-    let (wallet_key, _) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
     let sig = host_wallet_sign(&unsigned.sighash_hex, &wallet_key);
     let tx = finalize_submarine_refund(&unsigned, &sig).expect("finalize");
 
@@ -130,16 +169,19 @@ fn test_submarine_swap_refund_tx_from_record() {
 fn record_without_lockup_address_cannot_build_claim() {
     let mut rec = record(SwapKind::Reverse, SwapStatus::TransactionConfirmed);
     rec.preimage_hex = Some(hex::encode([1u8; 32]));
+    rec.claim_pubkey_hex = Some(hex::encode(keys().1));
     let err = claim_params_from_record(
         &rec,
         &"11".repeat(32),
         0,
+        50_000,
         "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
     )
     .unwrap_err();
     assert!(err.to_string().contains("lockup address"));
 }
 
+/// The mock wallet executor and the execution gate policy work together.
 #[tokio::test]
 async fn test_wallet_executor_and_gate_policy_interaction() {
     let mock = MockWalletExecutor::new(BitcoinNetwork::Testnet);
@@ -190,6 +232,7 @@ async fn test_wallet_executor_and_gate_policy_interaction() {
         .is_ok());
 }
 
+/// Claim/refund builders report unavailable until Taproot support lands.
 #[test]
 fn test_claim_refund_builders_blocked_until_taproot_support() {
     assert!(!claim_refund_builders_available(SwapKind::Submarine));
@@ -201,6 +244,7 @@ fn test_claim_refund_builders_blocked_until_taproot_support() {
     assert!(ensure_claim_refund_builders_available(SwapKind::Chain).is_err());
 }
 
+/// Swap creation fails closed before any request reaches Boltz.
 #[tokio::test]
 async fn swap_creation_fails_closed_before_contacting_boltz() {
     use satspath_swaps::boltz_client::BoltzClient;
@@ -274,17 +318,15 @@ fn confirmed_reverse_swap_is_recoverable() {
     assert!(!rec.is_recoverable());
 }
 
+/// Swap records no longer carry any spending-key field; old key fields in a
+/// record are ignored on parse and never written back.
 #[test]
-fn legacy_secret_keys_survive_a_store_rewrite() {
-    // Records written before swap keys moved to the host wallet still carry the
-    // secret keys; dropping them on rewrite would strand an in-flight swap.
+fn swap_records_never_serialize_spending_keys() {
     let json = r#"{"id":"old","kind":"reverse","status":"transaction.confirmed","amount_sats":1,
         "claim_key_hex":"aa","refund_key_hex":"bb","created_at":0,"updated_at":0}"#;
-    let rec: SwapRecord = serde_json::from_str(json).expect("legacy record parses");
-    assert_eq!(rec.legacy_claim_key_hex.as_deref(), Some("aa"));
-    assert_eq!(rec.legacy_refund_key_hex.as_deref(), Some("bb"));
+    let rec: SwapRecord = serde_json::from_str(json).expect("record parses");
     let out = serde_json::to_string(&rec).unwrap();
-    assert!(out.contains(r#""claim_key_hex":"aa""#) && out.contains(r#""refund_key_hex":"bb""#));
+    assert!(!out.contains("key_hex\":\"aa") && !out.contains("refund_key_hex"));
 }
 
 #[test]

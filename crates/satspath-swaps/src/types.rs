@@ -150,26 +150,6 @@ pub struct SwapRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_pubkey_hex: Option<String>,
 
-    /// Legacy only: a secret refund key stored by SatsPath versions that
-    /// generated swap keys themselves. Never set by current code; kept so a
-    /// rewrite of the store does not destroy an existing swap's recovery key.
-    #[serde(
-        default,
-        rename = "refund_key_hex",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub legacy_refund_key_hex: Option<String>,
-
-    /// Legacy only: a secret claim key stored by SatsPath versions that
-    /// generated swap keys themselves. Never set by current code; see
-    /// `legacy_refund_key_hex`.
-    #[serde(
-        default,
-        rename = "claim_key_hex",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub legacy_claim_key_hex: Option<String>,
-
     /// The Lightning invoice to pay (Submarine) or that was generated (Reverse).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,

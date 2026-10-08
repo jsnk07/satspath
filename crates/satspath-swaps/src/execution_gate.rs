@@ -27,6 +27,7 @@ pub fn ensure_claim_refund_builders_available(kind: SwapKind) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Execution stays gated until Taproot claim/refund support exists.
     #[test]
     fn execution_blocked_until_taproot_claim_refund_exists() {
         assert!(ensure_claim_refund_builders_available(SwapKind::Submarine).is_err());

@@ -101,8 +101,6 @@ pub async fn create_reverse(
         preimage_hash_hex: Some(hex::encode(preimage_hash)),
         refund_pubkey_hex: None,
         claim_pubkey_hex: Some(claim_pubkey_hex),
-        legacy_refund_key_hex: None,
-        legacy_claim_key_hex: None,
         invoice: Some(resp.invoice.clone()),
         lockup_address: Some(resp.lockup_address.clone()),
         expected_amount_sats: Some(params.receive_amount_sats),

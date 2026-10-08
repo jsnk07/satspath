@@ -7,13 +7,21 @@
 //!
 //! Only P2WSH HTLCs are supported. Boltz v2 Taproot swaps need a MuSig2
 //! key-path or BIP-341 script-path spend, which these builders do not produce.
+//!
+//! Before anything is built, the witness script is parsed against Boltz's two
+//! P2WSH HTLC templates and its terms (payment hash, claim key, refund key,
+//! timeout) are compared with what the swap expects. A script that merely
+//! hashes to the lockup address is not enough: a counterparty could lock funds
+//! to a script with different keys or timelock.
 
 use std::str::FromStr;
 
 use base64::Engine;
 use bitcoin::absolute::LockTime;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::blockdata::opcodes::all as op;
+use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 use bitcoin::psbt::{Psbt, PsbtSighashType};
+use bitcoin::script::{Instruction, Script};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
     Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
@@ -31,12 +39,19 @@ pub struct ReverseClaimTxParams {
     pub lockup_txid: String,
     /// Output index (vout) of the lockup UTXO.
     pub lockup_vout: u32,
-    /// Amount locked by Boltz in satoshis.
+    /// Value of the lockup UTXO as observed on-chain, in satoshis. This is the
+    /// amount the BIP-143 sighash commits to, so it must be the real output
+    /// value, not the invoice amount.
     pub lockup_amount_sats: u64,
     /// P2WSH address of the lockup output; must commit to the witness script.
     pub lockup_address: String,
     /// 32-byte secret preimage in hex (revealed on-chain to claim funds).
     pub preimage_hex: String,
+    /// Host-wallet public key (compressed hex) that the HTLC must name as the
+    /// claim key.
+    pub claim_pubkey_hex: String,
+    /// Expected HTLC timeout height, if known; checked against the script.
+    pub timeout_block_height: Option<u32>,
     /// Destination address where claimed funds will land.
     pub destination_address: String,
     /// P2WSH HTLC witness script hex. Required: the claim cannot be spent without it.
@@ -54,12 +69,19 @@ pub struct SubmarineRefundTxParams {
     pub lockup_txid: String,
     /// Output index (vout) of the lockup UTXO.
     pub lockup_vout: u32,
-    /// Amount locked by client in satoshis.
+    /// Value of the lockup UTXO as observed on-chain, in satoshis (the amount
+    /// the BIP-143 sighash commits to).
     pub lockup_amount_sats: u64,
     /// P2WSH address of the lockup output; must commit to the witness script.
     pub lockup_address: String,
-    /// CLTV timeout block height after which refund is valid.
+    /// CLTV timeout block height after which refund is valid. Must equal the
+    /// timeout in the HTLC script.
     pub timeout_block_height: u32,
+    /// Host-wallet public key (compressed hex) that the HTLC must name as the
+    /// refund key.
+    pub refund_pubkey_hex: String,
+    /// SHA-256 payment hash (hex) the HTLC must commit to, if known.
+    pub preimage_hash_hex: Option<String>,
     /// Destination address where refunded funds will land.
     pub destination_address: String,
     /// P2WSH HTLC witness script hex. Required: the refund cannot be spent without it.
@@ -102,6 +124,20 @@ pub fn build_reverse_claim_tx(params: ReverseClaimTxParams) -> Result<UnsignedSw
         &params.lockup_address,
         params.redeem_script_hex.as_deref(),
     )?;
+    let terms = parse_htlc_script(&input.witness_script)?;
+    if terms.payment_hash160 != hash160::Hash::hash(&preimage).to_byte_array() {
+        return Err(htlc_mismatch("payment hash does not match the preimage"));
+    }
+    if terms.claim_pubkey != decode_pubkey(&params.claim_pubkey_hex, "claim")? {
+        return Err(htlc_mismatch(
+            "claim key is not the host wallet's claim key",
+        ));
+    }
+    if let Some(timeout) = params.timeout_block_height {
+        if terms.timeout_block_height != timeout {
+            return Err(htlc_mismatch("timeout does not match the swap"));
+        }
+    }
 
     let mut built = input.build_unsigned(
         &params.destination_address,
@@ -135,6 +171,28 @@ pub fn build_submarine_refund_tx(params: SubmarineRefundTxParams) -> Result<Unsi
         &params.lockup_address,
         params.redeem_script_hex.as_deref(),
     )?;
+    let terms = parse_htlc_script(&input.witness_script)?;
+    if terms.refund_pubkey != decode_pubkey(&params.refund_pubkey_hex, "refund")? {
+        return Err(htlc_mismatch(
+            "refund key is not the host wallet's refund key",
+        ));
+    }
+    // nLockTime comes from the swap; the script's CLTV must be the same height,
+    // or the refund is either premature or permanently invalid.
+    if terms.timeout_block_height != params.timeout_block_height {
+        return Err(htlc_mismatch(
+            "timeout does not match the refund's lock time",
+        ));
+    }
+    if let Some(hash_hex) = &params.preimage_hash_hex {
+        let payment_hash: [u8; 32] = hex::decode(hash_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| SwapError::Key("Invalid preimage hash hex".into()))?;
+        if terms.payment_hash160 != ripemd160::Hash::hash(&payment_hash).to_byte_array() {
+            return Err(htlc_mismatch("payment hash does not match the swap"));
+        }
+    }
 
     // Any non-final sequence enables nLockTime, which the CLTV branch requires.
     input.build_unsigned(
@@ -168,24 +226,35 @@ pub fn finalize_submarine_refund(
 }
 
 /// Helper to build claim parameters directly from a persisted SwapRecord.
+///
+/// `lockup_amount_sats` is the value of the lockup UTXO as observed on-chain.
+/// For a reverse swap it is below the invoice amount (Boltz deducts its fees),
+/// and the sighash must commit to the real value.
 pub fn claim_params_from_record(
     record: &SwapRecord,
     lockup_txid: &str,
     lockup_vout: u32,
+    lockup_amount_sats: u64,
     destination_address: &str,
 ) -> Result<ReverseClaimTxParams> {
     let preimage_hex = record
         .preimage_hex
         .clone()
         .ok_or_else(|| SwapError::Key("Record missing preimage".into()))?;
+    let claim_pubkey_hex = record
+        .claim_pubkey_hex
+        .clone()
+        .ok_or_else(|| SwapError::Key("Record missing host-wallet claim public key".into()))?;
 
     Ok(ReverseClaimTxParams {
         swap_id: record.id.clone(),
         lockup_txid: lockup_txid.to_string(),
         lockup_vout,
-        lockup_amount_sats: record.expected_amount_sats.unwrap_or(record.amount_sats),
+        lockup_amount_sats,
         lockup_address: record_lockup_address(record)?,
         preimage_hex,
+        claim_pubkey_hex,
+        timeout_block_height: record.timeout_block_height,
         destination_address: destination_address.to_string(),
         redeem_script_hex: record.redeem_script.clone(),
         miner_fee_sats: 1000,
@@ -193,23 +262,32 @@ pub fn claim_params_from_record(
 }
 
 /// Helper to build refund parameters directly from a persisted SwapRecord.
+///
+/// `lockup_amount_sats` is the value of the lockup UTXO as observed on-chain.
 pub fn refund_params_from_record(
     record: &SwapRecord,
     lockup_txid: &str,
     lockup_vout: u32,
+    lockup_amount_sats: u64,
     destination_address: &str,
 ) -> Result<SubmarineRefundTxParams> {
     let timeout_block_height = record
         .timeout_block_height
         .ok_or_else(|| SwapError::Key("Record missing timeout block height".into()))?;
+    let refund_pubkey_hex = record
+        .refund_pubkey_hex
+        .clone()
+        .ok_or_else(|| SwapError::Key("Record missing host-wallet refund public key".into()))?;
 
     Ok(SubmarineRefundTxParams {
         swap_id: record.id.clone(),
         lockup_txid: lockup_txid.to_string(),
         lockup_vout,
-        lockup_amount_sats: record.expected_amount_sats.unwrap_or(record.amount_sats),
+        lockup_amount_sats,
         lockup_address: record_lockup_address(record)?,
         timeout_block_height,
+        refund_pubkey_hex,
+        preimage_hash_hex: record.preimage_hash_hex.clone(),
         destination_address: destination_address.to_string(),
         redeem_script_hex: record.redeem_script.clone(),
         miner_fee_sats: 1000,
@@ -226,6 +304,7 @@ struct HtlcInput {
 }
 
 impl HtlcInput {
+    /// Decode the lockup input and check the script commits to the lockup address.
     fn new(
         lockup_txid: &str,
         lockup_vout: u32,
@@ -258,6 +337,7 @@ impl HtlcInput {
         })
     }
 
+    /// Build the one-input, one-output transaction, its sighash and PSBT.
     fn build_unsigned(
         &self,
         destination_address: &str,
@@ -348,6 +428,149 @@ fn finalize(
     Ok(tx)
 }
 
+/// The terms of a Boltz P2WSH HTLC, read from its witness script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtlcTerms {
+    /// HASH160 (RIPEMD160 of SHA-256) of the preimage the claim path requires.
+    pub payment_hash160: [u8; 20],
+    /// Compressed public key that can claim with the preimage.
+    pub claim_pubkey: [u8; 33],
+    /// Compressed public key that can refund after the timeout.
+    pub refund_pubkey: [u8; 33],
+    /// Absolute block height of the refund timelock (OP_CHECKLOCKTIMEVERIFY).
+    pub timeout_block_height: u32,
+}
+
+/// Parse a Boltz P2WSH HTLC witness script. Accepts exactly the two templates
+/// Boltz uses and rejects anything else:
+///
+/// * reverse swap: `OP_SIZE 32 OP_EQUAL OP_IF OP_HASH160 <h160> OP_EQUALVERIFY
+///   <claim> OP_ELSE OP_DROP <cltv> OP_CLTV OP_DROP <refund> OP_ENDIF OP_CHECKSIG`
+/// * submarine swap: `OP_HASH160 <h160> OP_EQUAL OP_IF <claim> OP_ELSE <cltv>
+///   OP_CLTV OP_DROP <refund> OP_ENDIF OP_CHECKSIG`
+pub fn parse_htlc_script(script: &Script) -> Result<HtlcTerms> {
+    let unrecognized = || htlc_mismatch("script is not a recognized Boltz P2WSH HTLC");
+    let tokens = script
+        .instructions_minimal()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| unrecognized())?;
+    let opcode = |i: usize, expected: bitcoin::Opcode| matches!(tokens.get(i), Some(Instruction::Op(o)) if *o == expected);
+    let push = |i: usize, len: usize| match tokens.get(i) {
+        Some(Instruction::PushBytes(b)) if b.len() == len => Some(b.as_bytes().to_vec()),
+        _ => None,
+    };
+    let cltv = |i: usize| match tokens.get(i) {
+        Some(Instruction::PushBytes(b)) if !b.is_empty() && b.len() <= 5 => {
+            bitcoin::script::read_scriptint(b.as_bytes())
+                .ok()
+                .and_then(|n| u32::try_from(n).ok())
+        }
+        _ => None,
+    };
+
+    // Reverse-swap template.
+    let reverse = tokens.len() == 16
+        && opcode(0, op::OP_SIZE)
+        && push(1, 1).as_deref() == Some(&[32u8][..])
+        && opcode(2, op::OP_EQUAL)
+        && opcode(3, op::OP_IF)
+        && opcode(4, op::OP_HASH160)
+        && opcode(6, op::OP_EQUALVERIFY)
+        && opcode(8, op::OP_ELSE)
+        && opcode(9, op::OP_DROP)
+        && opcode(11, op::OP_CLTV)
+        && opcode(12, op::OP_DROP)
+        && opcode(14, op::OP_ENDIF)
+        && opcode(15, op::OP_CHECKSIG);
+    // Submarine-swap template.
+    let submarine = tokens.len() == 12
+        && opcode(0, op::OP_HASH160)
+        && opcode(2, op::OP_EQUAL)
+        && opcode(3, op::OP_IF)
+        && opcode(5, op::OP_ELSE)
+        && opcode(7, op::OP_CLTV)
+        && opcode(8, op::OP_DROP)
+        && opcode(10, op::OP_ENDIF)
+        && opcode(11, op::OP_CHECKSIG);
+
+    let (hash_at, claim_at, cltv_at, refund_at) = if reverse {
+        (5, 7, 10, 13)
+    } else if submarine {
+        (1, 4, 6, 9)
+    } else {
+        return Err(unrecognized());
+    };
+    let payment_hash160 = push(hash_at, 20).ok_or_else(unrecognized)?;
+    let claim_pubkey = push(claim_at, 33).ok_or_else(unrecognized)?;
+    let refund_pubkey = push(refund_at, 33).ok_or_else(unrecognized)?;
+    let timeout_block_height = cltv(cltv_at).ok_or_else(unrecognized)?;
+    for key in [&claim_pubkey, &refund_pubkey] {
+        bitcoin::secp256k1::PublicKey::from_slice(key).map_err(|_| unrecognized())?;
+    }
+    Ok(HtlcTerms {
+        payment_hash160: payment_hash160.try_into().map_err(|_| unrecognized())?,
+        claim_pubkey: claim_pubkey.try_into().map_err(|_| unrecognized())?,
+        refund_pubkey: refund_pubkey.try_into().map_err(|_| unrecognized())?,
+        timeout_block_height,
+    })
+}
+
+/// Build the Boltz reverse-swap P2WSH HTLC script for `terms`.
+pub fn reverse_htlc_script(terms: &HtlcTerms) -> ScriptBuf {
+    bitcoin::script::Builder::new()
+        .push_opcode(op::OP_SIZE)
+        .push_int(32)
+        .push_opcode(op::OP_EQUAL)
+        .push_opcode(op::OP_IF)
+        .push_opcode(op::OP_HASH160)
+        .push_slice(terms.payment_hash160)
+        .push_opcode(op::OP_EQUALVERIFY)
+        .push_slice(terms.claim_pubkey)
+        .push_opcode(op::OP_ELSE)
+        .push_opcode(op::OP_DROP)
+        .push_int(i64::from(terms.timeout_block_height))
+        .push_opcode(op::OP_CLTV)
+        .push_opcode(op::OP_DROP)
+        .push_slice(terms.refund_pubkey)
+        .push_opcode(op::OP_ENDIF)
+        .push_opcode(op::OP_CHECKSIG)
+        .into_script()
+}
+
+/// Build the Boltz submarine-swap P2WSH HTLC script for `terms`.
+pub fn submarine_htlc_script(terms: &HtlcTerms) -> ScriptBuf {
+    bitcoin::script::Builder::new()
+        .push_opcode(op::OP_HASH160)
+        .push_slice(terms.payment_hash160)
+        .push_opcode(op::OP_EQUAL)
+        .push_opcode(op::OP_IF)
+        .push_slice(terms.claim_pubkey)
+        .push_opcode(op::OP_ELSE)
+        .push_int(i64::from(terms.timeout_block_height))
+        .push_opcode(op::OP_CLTV)
+        .push_opcode(op::OP_DROP)
+        .push_slice(terms.refund_pubkey)
+        .push_opcode(op::OP_ENDIF)
+        .push_opcode(op::OP_CHECKSIG)
+        .into_script()
+}
+
+/// An HTLC term that does not match what the swap expects.
+fn htlc_mismatch(what: &str) -> SwapError {
+    SwapError::Key(format!("HTLC script rejected: {what}"))
+}
+
+/// Decode a compressed public key from hex.
+fn decode_pubkey(hex_key: &str, label: &str) -> Result<[u8; 33]> {
+    let bytes = hex::decode(hex_key)
+        .map_err(|e| SwapError::Key(format!("Invalid {label} public key hex: {e}")))?;
+    bitcoin::secp256k1::PublicKey::from_slice(&bytes)
+        .map_err(|e| SwapError::Key(format!("Invalid {label} public key: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| SwapError::Key(format!("{label} public key must be compressed")))
+}
+
 fn decode_preimage(preimage_hex: &str) -> Result<[u8; 32]> {
     hex::decode(preimage_hex)
         .map_err(|e| SwapError::Key(format!("Invalid preimage hex: {e}")))?
@@ -394,24 +617,86 @@ mod tests {
 
     const DEST: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     const PREIMAGE: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-    const SCRIPT: &str = "6352670068";
+    const TIMEOUT: u32 = 850_000;
 
+    /// The host wallet's key (claims reverse swaps, refunds submarine swaps).
+    fn wallet_secret() -> SecretKey {
+        SecretKey::from_slice(&[3u8; 32]).unwrap()
+    }
+
+    /// Compressed public key for `secret`.
+    fn pubkey(secret: &SecretKey) -> [u8; 33] {
+        secret.public_key(&Secp256k1::new()).serialize()
+    }
+
+    /// Boltz's key in these tests.
+    fn boltz_pubkey() -> [u8; 33] {
+        pubkey(&SecretKey::from_slice(&[2u8; 32]).unwrap())
+    }
+
+    /// Terms of a reverse swap the host wallet can claim with `PREIMAGE`.
+    fn reverse_terms() -> HtlcTerms {
+        HtlcTerms {
+            payment_hash160: hash160::Hash::hash(&hex::decode(PREIMAGE).unwrap()).to_byte_array(),
+            claim_pubkey: pubkey(&wallet_secret()),
+            refund_pubkey: boltz_pubkey(),
+            timeout_block_height: TIMEOUT,
+        }
+    }
+
+    /// Terms of a submarine swap the host wallet can refund after `TIMEOUT`.
+    fn submarine_terms() -> HtlcTerms {
+        HtlcTerms {
+            claim_pubkey: boltz_pubkey(),
+            refund_pubkey: pubkey(&wallet_secret()),
+            ..reverse_terms()
+        }
+    }
+
+    /// Hex of the reverse-swap HTLC script.
+    fn reverse_script_hex() -> String {
+        hex::encode(reverse_htlc_script(&reverse_terms()).as_bytes())
+    }
+
+    /// Testnet P2WSH address committing to `script_hex`.
     fn lockup_address(script_hex: &str) -> String {
         let script = ScriptBuf::from_bytes(hex::decode(script_hex).unwrap());
         Address::p2wsh(&script, Network::Testnet).to_string()
     }
 
+    /// Claim parameters for the reverse swap, with the given witness script.
     fn claim_params(redeem_script_hex: Option<String>) -> ReverseClaimTxParams {
         ReverseClaimTxParams {
             swap_id: "swap_rev".into(),
             lockup_txid: "0000000000000000000000000000000000000000000000000000000000000003".into(),
             lockup_vout: 0,
             lockup_amount_sats: 60_000,
-            lockup_address: lockup_address(SCRIPT),
+            lockup_address: lockup_address(&reverse_script_hex()),
             preimage_hex: PREIMAGE.into(),
+            claim_pubkey_hex: hex::encode(pubkey(&wallet_secret())),
+            timeout_block_height: Some(TIMEOUT),
             destination_address: DEST.into(),
             redeem_script_hex,
             miner_fee_sats: 1_000,
+        }
+    }
+
+    /// Refund parameters for the submarine swap.
+    fn refund_params() -> SubmarineRefundTxParams {
+        let script_hex = hex::encode(submarine_htlc_script(&submarine_terms()).as_bytes());
+        let payment_hash = sha256::Hash::hash(&hex::decode(PREIMAGE).unwrap());
+        SubmarineRefundTxParams {
+            swap_id: "swap_sub".into(),
+            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000002".into(),
+            lockup_vout: 1,
+            lockup_amount_sats: 100_000,
+            lockup_address: lockup_address(&script_hex),
+            timeout_block_height: TIMEOUT,
+            refund_pubkey_hex: hex::encode(pubkey(&wallet_secret())),
+            preimage_hash_hex: Some(hex::encode(payment_hash.to_byte_array())),
+            destination_address: DEST.into(),
+            redeem_script_hex: Some(script_hex),
+            miner_fee_sats: 1_500,
         }
     }
 
@@ -424,14 +709,32 @@ mod tests {
         out
     }
 
+    /// Both Boltz templates parse back to the terms they were built from;
+    /// anything else is rejected.
+    #[test]
+    fn htlc_templates_round_trip_and_others_are_rejected() {
+        let rev = reverse_terms();
+        assert_eq!(parse_htlc_script(&reverse_htlc_script(&rev)).unwrap(), rev);
+        let sub = submarine_terms();
+        assert_eq!(
+            parse_htlc_script(&submarine_htlc_script(&sub)).unwrap(),
+            sub
+        );
+        for junk in ["6352670068", "51", ""] {
+            let script = ScriptBuf::from_bytes(hex::decode(junk).unwrap());
+            assert!(parse_htlc_script(&script).is_err(), "{junk}");
+        }
+    }
+
+    /// The PSBT carries the witness UTXO, witness script and preimage.
     #[test]
     fn reverse_claim_psbt_carries_what_the_wallet_needs() {
-        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
+        let built = build_reverse_claim_tx(claim_params(Some(reverse_script_hex()))).unwrap();
         assert_eq!(built.output_amount_sats, 59_000);
         assert_eq!(built.fee_sats, 1_000);
 
         let input = &built.psbt.inputs[0];
-        let script = ScriptBuf::from_bytes(hex::decode(SCRIPT).unwrap());
+        let script = reverse_htlc_script(&reverse_terms());
         assert_eq!(input.witness_script.as_ref(), Some(&script));
         let utxo = input.witness_utxo.as_ref().unwrap();
         assert_eq!(utxo.value.to_sat(), 60_000);
@@ -452,20 +755,23 @@ mod tests {
         assert_eq!(Psbt::deserialize(&decoded).unwrap(), built.psbt);
     }
 
+    /// The reported sighash is the BIP-143 digest over the lockup value.
     #[test]
     fn sighash_is_the_bip143_digest() {
-        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
-        let script = ScriptBuf::from_bytes(hex::decode(SCRIPT).unwrap());
+        let built = build_reverse_claim_tx(claim_params(Some(reverse_script_hex()))).unwrap();
+        let script = reverse_htlc_script(&reverse_terms());
         let expected = SighashCache::new(&built.psbt.unsigned_tx)
             .p2wsh_signature_hash(0, &script, Amount::from_sat(60_000), EcdsaSighashType::All)
             .unwrap();
         assert_eq!(built.sighash_hex, hex::encode(expected.to_byte_array()));
     }
 
+    /// The finalized claim has the HTLC witness and a signature that verifies
+    /// under the claim key named in the script.
     #[test]
     fn finalized_claim_has_htlc_witness_and_verifiable_signature() {
-        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
-        let secret = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let built = build_reverse_claim_tx(claim_params(Some(reverse_script_hex()))).unwrap();
+        let secret = wallet_secret();
         let sig = wallet_sign(&built.sighash_hex, &secret);
 
         let tx = finalize_reverse_claim(&built, &sig, PREIMAGE).unwrap();
@@ -473,7 +779,10 @@ mod tests {
         assert_eq!(witness.len(), 3);
         assert_eq!(witness.nth(0).unwrap(), &sig[..]);
         assert_eq!(witness.nth(1).unwrap(), &hex::decode(PREIMAGE).unwrap()[..]);
-        assert_eq!(witness.nth(2).unwrap(), &hex::decode(SCRIPT).unwrap()[..]);
+        assert_eq!(
+            witness.nth(2).unwrap(),
+            &hex::decode(reverse_script_hex()).unwrap()[..]
+        );
         assert_eq!(tx.compute_txid().to_string(), built.txid);
 
         let digest: [u8; 32] = hex::decode(&built.sighash_hex).unwrap().try_into().unwrap();
@@ -487,9 +796,10 @@ mod tests {
             .expect("signature over the PSBT sighash must verify");
     }
 
+    /// A script that does not hash to the lockup address is rejected.
     #[test]
     fn mismatched_redeem_script_is_rejected() {
-        let mut params = claim_params(Some(SCRIPT.into()));
+        let mut params = claim_params(Some(reverse_script_hex()));
         params.lockup_address = lockup_address("6352670168");
         let err = build_reverse_claim_tx(params).unwrap_err();
         assert!(err
@@ -497,48 +807,75 @@ mod tests {
             .contains("does not match the lockup address"));
     }
 
+    /// A claim cannot be built without the witness script.
     #[test]
     fn claim_without_redeem_script_is_rejected() {
         let err = build_reverse_claim_tx(claim_params(None)).unwrap_err();
         assert!(err.to_string().contains("Redeem script missing"));
     }
 
+    /// An HTLC naming someone else's claim key, a different payment hash or a
+    /// different timeout is refused even though it matches the lockup address.
+    #[test]
+    fn claim_rejects_htlc_with_unexpected_terms() {
+        let other_key = pubkey(&SecretKey::from_slice(&[9u8; 32]).unwrap());
+        let variants = [
+            HtlcTerms {
+                claim_pubkey: other_key,
+                ..reverse_terms()
+            },
+            HtlcTerms {
+                payment_hash160: [7u8; 20],
+                ..reverse_terms()
+            },
+            HtlcTerms {
+                timeout_block_height: TIMEOUT + 1,
+                ..reverse_terms()
+            },
+        ];
+        for terms in variants {
+            let script_hex = hex::encode(reverse_htlc_script(&terms).as_bytes());
+            let mut params = claim_params(Some(script_hex.clone()));
+            params.lockup_address = lockup_address(&script_hex);
+            let err = build_reverse_claim_tx(params).unwrap_err();
+            assert!(err.to_string().contains("HTLC script rejected"), "{err}");
+        }
+    }
+
+    /// A non-SIGHASH_ALL signature is refused.
     #[test]
     fn finalize_rejects_non_sighash_all_signature() {
-        let built = build_reverse_claim_tx(claim_params(Some(SCRIPT.into()))).unwrap();
-        let mut sig = wallet_sign(
-            &built.sighash_hex,
-            &SecretKey::from_slice(&[3u8; 32]).unwrap(),
-        );
+        let built = build_reverse_claim_tx(claim_params(Some(reverse_script_hex()))).unwrap();
+        let mut sig = wallet_sign(&built.sighash_hex, &wallet_secret());
         *sig.last_mut().unwrap() = EcdsaSighashType::None.to_u32() as u8;
         assert!(finalize_reverse_claim(&built, &sig, PREIMAGE).is_err());
     }
 
+    /// The refund is timelocked to the script's CLTV and uses the timeout branch.
     #[test]
     fn submarine_refund_is_timelocked_and_finalizes_on_timeout_branch() {
-        let built = build_submarine_refund_tx(SubmarineRefundTxParams {
-            swap_id: "swap_sub".into(),
-            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000002".into(),
-            lockup_vout: 1,
-            lockup_amount_sats: 100_000,
-            lockup_address: lockup_address("6352670168"),
-            timeout_block_height: 850_000,
-            destination_address: DEST.into(),
-            redeem_script_hex: Some("6352670168".into()),
-            miner_fee_sats: 1_500,
-        })
-        .unwrap();
+        let built = build_submarine_refund_tx(refund_params()).unwrap();
         assert_eq!(built.output_amount_sats, 98_500);
         let unsigned = &built.psbt.unsigned_tx;
-        assert_eq!(unsigned.lock_time.to_consensus_u32(), 850_000);
+        assert_eq!(unsigned.lock_time.to_consensus_u32(), TIMEOUT);
         assert!(unsigned.input[0].sequence.enables_absolute_lock_time());
 
-        let sig = wallet_sign(
-            &built.sighash_hex,
-            &SecretKey::from_slice(&[2u8; 32]).unwrap(),
-        );
+        let sig = wallet_sign(&built.sighash_hex, &wallet_secret());
         let tx = finalize_submarine_refund(&built, &sig).unwrap();
         assert_eq!(tx.input[0].witness.len(), 3);
         assert!(tx.input[0].witness.nth(1).unwrap().is_empty());
+    }
+
+    /// A refund whose lock time differs from the script's CLTV, or whose HTLC
+    /// names another refund key, is refused.
+    #[test]
+    fn refund_rejects_mismatched_timeout_or_key() {
+        let mut early = refund_params();
+        early.timeout_block_height = TIMEOUT - 1;
+        assert!(build_submarine_refund_tx(early).is_err());
+
+        let mut foreign = refund_params();
+        foreign.refund_pubkey_hex = hex::encode(boltz_pubkey());
+        assert!(build_submarine_refund_tx(foreign).is_err());
     }
 }

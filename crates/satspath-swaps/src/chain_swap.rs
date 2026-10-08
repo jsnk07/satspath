@@ -121,8 +121,6 @@ pub async fn create_chain_swap(
         preimage_hash_hex: Some(hex::encode(preimage_hash)),
         refund_pubkey_hex: Some(refund_pubkey_hex),
         claim_pubkey_hex: Some(claim_pubkey_hex),
-        legacy_refund_key_hex: None,
-        legacy_claim_key_hex: None,
         invoice: None,
         lockup_address: Some(resp.lockup_details.lockup_address.clone()),
         expected_amount_sats: Some(resp.lockup_details.amount),

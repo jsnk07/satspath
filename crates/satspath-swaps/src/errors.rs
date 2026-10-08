@@ -31,6 +31,14 @@ pub enum SwapError {
     #[error("No recoverable swap found for id: {0}")]
     NotFound(String),
 
+    #[error(
+        "Swap store {0} holds swap spending keys written by an older SatsPath version. \
+         SatsPath no longer holds spending keys and will not load them. The file was not \
+         modified: back it up, finish or refund those swaps with the version that created \
+         them (or import the keys into your wallet), then remove the file."
+    )]
+    LegacySpendingKeys(String),
+
     // ── Amount validation ────────────────────────────────────────────────────
     #[error(
         "Amount {amount_sats} sats is below dust threshold {dust_sats} sats at {fee_rate} sat/vB"
