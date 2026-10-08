@@ -367,6 +367,32 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     if segments[0] & 0xfe00 == 0xfc00 {
         return true;
     }
+    // Deprecated site-local: fec0::/10 (RFC 3879); still routed internally by some networks
+    if segments[0] & 0xffc0 == 0xfec0 {
+        return true;
+    }
+    // IETF protocol assignments: 2001::/23, which includes Teredo (2001::/32,
+    // whose embedded IPv4 is obfuscated and cannot be checked), benchmarking
+    // (2001:2::/48) and ORCHID. None of it is a legitimate resolver target.
+    if segments[0] == 0x2001 && segments[1] & 0xfe00 == 0 {
+        return true;
+    }
+    // Documentation: 3fff::/20 (RFC 9637)
+    if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
+        return true;
+    }
+    // Discard-only: 100::/64 (RFC 6666)
+    if segments[..4] == [0x0100, 0, 0, 0] {
+        return true;
+    }
+    // Local-use NAT64: 64:ff9b:1::/48 (RFC 8215); the translator is site-internal
+    if segments[..3] == [0x0064, 0xff9b, 0x0001] {
+        return true;
+    }
+    // SRv6 SIDs: 5f00::/16 (RFC 9602)
+    if segments[0] == 0x5f00 {
+        return true;
+    }
     // IPv4-mapped: ::ffff:0:0/96 — check the embedded v4
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_private_v4(v4);
@@ -583,5 +609,39 @@ mod tests {
             .expect("localhost resolves via hosts file");
         assert!(ips.iter().all(|ip| ip.is_loopback()), "{ips:?}");
         assert!(check_resolved_addrs("localhost", &ips).is_err());
+    }
+
+    /// Special-use IPv6 ranges are refused while ordinary global addresses,
+    /// including ones just outside those ranges, stay allowed.
+    #[test]
+    fn special_use_ipv6_ranges_blocked() {
+        let blocked = [
+            "fec0::1",
+            "feff::1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:2::1",
+            "2001:1ff::1",
+            "3fff::1",
+            "3fff:fff::1",
+            "100::1",
+            "64:ff9b:1::1",
+            "5f00::1",
+        ];
+        for ip in blocked {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_private_or_reserved(ip), "{ip} must be blocked");
+        }
+        let allowed = [
+            "2001:4860:4860::8888",
+            "2001:200::1",
+            "2606:4700:4700::1111",
+            "3fff:1000::1",
+            "100:0:0:1::1",
+        ];
+        for ip in allowed {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_private_or_reserved(ip), "{ip} must stay allowed");
+        }
     }
 }
