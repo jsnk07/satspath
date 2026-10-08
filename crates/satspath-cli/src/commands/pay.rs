@@ -91,7 +91,7 @@ pub async fn cmd_pay(
             println!("No private keys touched.");
             return Ok(());
         }
-        Err(e) => return Err(anyhow::anyhow!("{}", e)),
+        Err(e) => return Err(resolution_error(e, debug)),
     };
     println!("  Found signed profile.");
 
@@ -169,6 +169,18 @@ pub async fn cmd_pay(
         println!("{line}");
     }
     Ok(())
+}
+
+/// Turn a resolver error into the user-facing error. A revoked profile is
+/// reported without the identifier unless `debug` is set, since the error's
+/// own text carries the full alias.
+fn resolution_error(err: SatsPathError, debug: bool) -> anyhow::Error {
+    match err {
+        SatsPathError::ProfileRevoked(_) if !debug => anyhow::anyhow!(
+            "Profile has been REVOKED by its owner. Do not pay this key. Aborting preview."
+        ),
+        e => anyhow::anyhow!("{}", e),
+    }
 }
 
 /// Abort before route selection if the recipient's owner revoked the profile.
@@ -523,12 +535,24 @@ fn preview_safety_lines() -> [&'static str; 5] {
 mod tests {
     use super::*;
 
+    /// Route preview never reaches swap execution.
     #[test]
     fn route_preview_does_not_call_swap_execution() {
         let joined = preview_safety_lines().join("\n").to_ascii_lowercase();
         assert!(joined.contains("no funds moved"));
         assert!(joined.contains("no signing performed"));
         assert!(!joined.contains("broadcast"));
+    }
+
+    /// A revoked-profile error omits the alias unless debug output is on.
+    #[test]
+    fn revoked_resolution_error_hides_alias_unless_debug() {
+        let err = || SatsPathError::ProfileRevoked("alice@example.com".into());
+        let quiet = resolution_error(err(), false).to_string();
+        assert!(quiet.contains("REVOKED"), "{quiet}");
+        assert!(!quiet.contains("alice"), "alias leaked: {quiet}");
+        let verbose = resolution_error(err(), true).to_string();
+        assert!(verbose.contains("alice@example.com"), "{verbose}");
     }
 
     /// pay refuses a revoked recipient before any route is selected.

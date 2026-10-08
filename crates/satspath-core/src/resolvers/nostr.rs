@@ -200,42 +200,46 @@ impl ProfileResolver for NostrResolver {
             .collect();
 
         let results = futures_util::future::join_all(futures).await;
+        select_relay_result(alias, results)
+    }
+}
 
-        let mut best_profile: Option<SignedPaymentProfile> = None;
-        let mut last_error = None;
+/// Pick the profile to return from the per-relay results.
+///
+/// Any verified revoked profile is terminal: a relay serving an older,
+/// non-revoked copy (even one with a higher claimed sequence) must not
+/// override the owner's revocation. Otherwise the highest sequence wins.
+fn select_relay_result(
+    alias: &str,
+    results: Vec<Result<SignedPaymentProfile>>,
+) -> Result<SignedPaymentProfile> {
+    let mut best_profile: Option<SignedPaymentProfile> = None;
+    let mut last_error = None;
 
-        for result in results {
-            match result {
-                Ok(signed) => {
-                    let current_best_seq = best_profile
-                        .as_ref()
-                        .and_then(|p| p.profile.sequence)
-                        .unwrap_or(0);
-                    let new_seq = signed.profile.sequence.unwrap_or(0);
-
-                    if best_profile.is_none() || new_seq > current_best_seq {
-                        best_profile = Some(signed);
-                    }
-                }
-                Err(e) => last_error = Some(e),
+    for result in results {
+        match result {
+            Ok(signed) if signed.profile.revoked => {
+                return Err(SatsPathError::ProfileRevoked(canonicalize_identifier(
+                    alias,
+                )));
             }
-        }
-
-        match best_profile {
-            Some(profile) => {
-                if profile.profile.revoked {
-                    Err(SatsPathError::ProfileRevoked(canonicalize_identifier(
-                        alias,
-                    )))
-                } else {
-                    Ok(profile)
+            Ok(signed) => {
+                let current_best_seq = best_profile
+                    .as_ref()
+                    .and_then(|p| p.profile.sequence)
+                    .unwrap_or(0);
+                let new_seq = signed.profile.sequence.unwrap_or(0);
+                if best_profile.is_none() || new_seq > current_best_seq {
+                    best_profile = Some(signed);
                 }
             }
-            None => match last_error {
-                Some(e) => Err(e),
-                None => Err(SatsPathError::AliasNotFound(alias.to_string())),
-            },
+            Err(e) => last_error = Some(e),
         }
+    }
+
+    match best_profile {
+        Some(profile) => Ok(profile),
+        None => Err(last_error.unwrap_or_else(|| SatsPathError::AliasNotFound(alias.to_string()))),
     }
 }
 
@@ -527,5 +531,30 @@ mod tests {
 
         let parsed = signed_profile_from_event(&raw, "sub", nostr_pk, "alice@example.com");
         assert!(parsed.is_err());
+    }
+
+    /// A revoked profile from any relay wins over non-revoked copies, even
+    /// ones claiming a higher sequence.
+    #[test]
+    fn revoked_relay_result_is_terminal() {
+        let alias = "alice@example.com";
+        let mut fresh = signed(alias);
+        fresh.profile.sequence = Some(9);
+        let mut revoked = signed(alias);
+        revoked.profile.sequence = Some(2);
+        revoked.profile.revoked = true;
+
+        let picked = select_relay_result(alias, vec![Ok(fresh.clone()), Ok(revoked)]);
+        assert!(
+            matches!(picked, Err(SatsPathError::ProfileRevoked(_))),
+            "{:?}",
+            picked.map(|p| p.profile.sequence)
+        );
+
+        let picked = select_relay_result(
+            alias,
+            vec![Ok(fresh), Err(SatsPathError::NetworkError("x".into()))],
+        );
+        assert_eq!(picked.unwrap().profile.sequence, Some(9));
     }
 }
